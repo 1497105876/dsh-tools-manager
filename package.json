@@ -1,13 +1,13 @@
 {
   "name": "@gw/dsh-tools-manager",
-  "version": "0.2.0",
-  "description": "DeepSeek Harness plugin: 按 Agent 预设（模式）遮蔽工具，带双栏设置页（左启用 / 右禁用）。一个插件管全部模式，规则不写死。",
+  "version": "0.3.0",
+  "description": "DeepSeek Harness plugin: 按 Agent 预设（模式）禁用工具。只有黑名单，没有白名单 —— 没被点名禁用的工具一概不碰。",
   "keywords": [
     "dsh",
     "deepseek-harness",
     "plugin",
     "tools",
-    "restrict",
+    "deny",
     "settings"
   ],
   "license": "MIT",
@@ -22,8 +22,7 @@
   "files": [
     "index.js",
     "client.js",
-    "cordis.patch.yml",
-    "README.md"
+    "cordis.patch.yml"
   ],
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.2"

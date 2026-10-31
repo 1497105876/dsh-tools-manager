@@ -1,757 +1,408 @@
 /**
- * dsh-tools-manager —— 按 Agent 预设（模式）隐藏工具，带设置页。
+ * dsh-tools-manager —— 按 Agent 预设（模式）禁用工具。
  *
- * ── 机制（官方唯一认可的做法）─────────────────────────────────
- * 隐藏工具只能用 ctx.tools.restrict()，而且必须调在**那个 agent 自己的 ctx** 上。
+ * ── 只做一件事 ────────────────────────────────────────────────
+ * 把某个模式下你不想要的那几个工具禁掉。**不负责启用** —— 没被禁的一概不碰，
+ * 谁能让它出现、谁让它消失，全归 dsh 自己和别的插件。所以这里没有白名单，
+ * 也没有任何「已启用」的概念。
  *
- * 官方文档原话：
- *   "Hiding tools from one agent is `ctx.tools.restrict()` on that agent's context;
- *    it keeps schema presentation, lookup, and execution aligned.
- *    Do not listen to `system-prompt/assemble` to add or remove tools or text."
+ * ── 两个 API，各管一头 ─────────────────────────────────────────
+ *   tools.restrict({ deny })  让模型看不见（schema 层）
+ *   tools.guard(fn)           让它调不动（执行层，monotonic，谁也翻不了案）
  *
- * 官方自己应用 subagent toolFilter 的写法（applyChildOverrides）：
- *   childCtx.tools.restrict(composition.toolFilter)
- *   —— 直接用属性访问，**没有经过 inject**。
+ * 两个都必须注册在 **agent 自己的 ctx** 上：
+ *   restrict 只过滤「继承来的」工具（global + 祖先层），永远不过滤本层注册的；
+ *   guard 按 scope 链匹配，注册在派生出来的子 scope 上就谁也拦不住。
+ * 官方 subagent 也是这么写的：childCtx.tools.restrict(composition.toolFilter)。
  *
- * ⚠ 踩过的两个坑，别再犯：
- *   1) agent.ctx.inject(['tools'], scope => scope.tools.restrict(...)) 不生效。
- *      inject 会派生出一个新的子 scope，scopeOf(this.ctx) 认到的是那个子 scope，
- *      限制落在了子 scope 上，跟真正的 agent 不是一回事。必须用 agent.ctx.tools。
- *   2) 用 system-prompt/assemble 改 result.tools 不生效，而且官方明确禁止。
- *      工具 schema 不是从那条路送达模型的。
+ * ── 装法：全撤全装，绝不叠加 ───────────────────────────────────
+ * dsh 的 restriction 是 intersect 语义（dsh-tools README: "Restrictions
+ * intersect"），每调一次 restrict 就往层里 append 一条新的，append 返回的
+ * undo 只管这一次。旧版本每次都叠一层新的、只撤最后一个 —— 泄漏的层继续
+ * deny，于是界面上「放开了」而工具照样不能用。
  *
- * restrict 的返回值就是撤销句柄，绑在 agent 的 fiber 上，agent 销毁自动解除。
+ * 所以这里维护 handles 数组：重装前先全部撤干净，再一次性装回去。
  *
- * ── 规则来源（后者覆盖前者）──────────────────────────────────
- *   1. config.rules  —— cordis.patch.yml 里的初始值
- *   2. rules.json    —— 设置页保存的结果（~/.dsh/plugin-data/tools-manager/rules.json）
+ * ── 规则文件 ───────────────────────────────────────────────────
+ * <DSH_HOME>/plugin-data/tools-manager/rules.json
+ *   { "version": 2, "rules": { "qq": { "deny": ["bash"] }, "*": { "deny": [] } } }
+ *
+ * 不按 profile 分文件 —— 规则是按 preset 索引的，而 preset 名跨 profile 唯一。
+ * 旧版本按 profile 分目录，结果 profile 探测失败时静默退回全局目录，同一个
+ * 「设置」被写进两个文件、内容还不一样。
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { fileURLToPath } from 'node:url'
 
 export const name = 'tools-manager'
-
-/**
- * inject 声明：cordis 严格模式下，没声明就访问属性会直接抛错，而且它还会等你声明的服务就绪。
- *   webServer    —— 设置页接口（不 inject 会 404）
- *   agentPresets —— 读「这个 agent 实际挂载的 preset」，核心依赖
- * tools / dshHomePath 走 ctx.get()，按可选处理（拿不到就降级，不让插件起不来）。
- */
-export const inject = ['webServer', 'agentPresets']
-
-
-/**
- * 当前 profile 名（没有就是空串）。判定顺序照 @gw/dsh-media-studio 的 profile-dir.js：
- * DSH_PROFILE 环境变量 → CLI argv（--profile x / --profile=x / dsh x）→ 空。
- * 只有 <home>/profiles/<name> 真实存在才算数，避免写到一个不存在的目录。
- */
-function detectProfileName(ctx) {
-    const base = String(process.env.DSH_HOME ?? '').trim() || join(homedir(), '.dsh')
-    const profilesDir = join(base, 'profiles')
-    const valid = (raw) => {
-        const value = String(raw ?? '').trim()
-        if (value === '' || value.startsWith('.') || value.includes('..')) return ''
-        if (/[\\/:*?"<>|]/.test(value)) return ''
-        return existsSync(join(profilesDir, value)) ? value : ''
-    }
-    const fromEnv = valid(process.env.DSH_PROFILE)
-    if (fromEnv !== '') return fromEnv
-    const argv = process.argv.slice(2)
-    for (let i = 0; i < argv.length; i += 1) {
-        const arg = String(argv[i] ?? '')
-        if (arg === '--profile') return valid(argv[i + 1])
-        if (arg.startsWith('--profile=')) return valid(arg.slice('--profile='.length))
-        if (i === 0 && arg !== '' && !arg.startsWith('-') && arg !== 'plugin') return valid(arg)
-    }
-    // ③ 从 cordis 的 ctx 推断：profile 启动时 baseDir/baseUrl 指向 <home>/profiles/<name>。
-    //    ⚠ 严格模式下访问未 inject 的属性会直接抛错（cannot get property "x" without inject），
-    //    所以每一次访问都必须单独包在 try 里 —— 写成数组字面量再 for 就晚了，求值那一步就炸。
-    const probes = []
-    const probe = (getter) => {
-        try {
-            const value = getter()
-            if (typeof value === 'string' && value !== '') probes.push(value)
-        } catch {
-            /* 这个属性需要 inject 或有副作用，跳过 */
-        }
-    }
-    probe(() => ctx?.baseUrl)
-    probe(() => ctx?.baseDir)
-    probe(() => ctx?.get?.('loader')?.baseDir)
-    probe(() => ctx?.get?.('loader')?.baseUrl)
-
-    for (const raw of probes) {
-        try {
-            const dir = raw.startsWith('file:') ? fileURLToPath(raw) : raw
-            const matched = /[\\/]profiles[\\/]([^\\/]+)/.exec(dir)
-            if (matched !== null) {
-                const name = valid(matched[1])
-                if (name !== '') return name
-            }
-        } catch {
-            /* 换下一个来源 */
-        }
-    }
-    return ''
-}
+// agentPresets 是必需依赖（读「这个 agent 实际挂载的 preset」）。
+// webServer 不 inject —— 没有它只是没设置页，禁用逻辑照样跑，不该整个插件起不来。
+export const inject = ['agentPresets']
 
 /** 设置页接口前缀 —— 浏览器半的 fetch 必须跟这里一致。 */
 const API_PREFIX = '/api/plugins/tools-manager'
 
-/** 内置模式，拿不到名册时兜底用（不是白名单，只是提示）。 */
+/** 规则文件格式版本。v1 是 { denyNames, denyPrefixes }，v2 只有 deny。 */
+const RULES_VERSION = 2
+
+/** 名册拿不到时的兜底提示（不是白名单）。 */
 const BUILTIN_PRESETS = ['standard', 'ptc', 'minimal', 'cordis']
 
-function stringsOf(value) {
-    if (!Array.isArray(value)) return []
-    return value.filter((item) => typeof item === 'string' && item.trim() !== '').map((item) => item.trim())
+/** 兜底规则的 key：没单独配置的模式都落到它。 */
+const WILDCARD = '*'
+
+const homeDir = () => String(process.env.DSH_HOME ?? '').trim() || join(homedir(), '.dsh')
+
+const pluginDataDir = () => join(homeDir(), 'plugin-data', 'tools-manager')
+
+const rulesPath = () => join(pluginDataDir(), 'rules.json')
+
+const isNonEmptyString = (value) => typeof value === 'string' && value.trim() !== ''
+
+//#region 规则读写
+
+/** 把任意来源的一条规则拆成工具名数组（v2 的 deny + v1 的 denyNames）。 */
+function namesOf(rule) {
+    if (rule === null || typeof rule !== 'object' || Array.isArray(rule)) return []
+    const raw = [
+        ...(Array.isArray(rule.deny) ? rule.deny : []),
+        ...(Array.isArray(rule.denyNames) ? rule.denyNames : [])
+    ]
+    return [...new Set(raw.filter(isNonEmptyString).map((item) => item.trim()))]
 }
 
-/** 把一条规则归一化；空规则返回 undefined（视为没配）。只有「要禁什么」，没有「要启用什么」。 */
-function normalizeRule(raw) {
-    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return undefined
-    const rule = {
-        denyNames: stringsOf(raw.denyNames),
-        denyPrefixes: stringsOf(raw.denyPrefixes)
+/** 收集一个 v1 文件里的全部规则，灌进 target（Map<presetId, Set<name>>）。 */
+function absorbLegacy(target, file) {
+    try {
+        const parsed = JSON.parse(readFileSync(file, 'utf8'))
+        if (parsed?.version === RULES_VERSION) return
+        const raw = parsed?.rules
+        if (raw === null || typeof raw !== 'object') return
+        for (const [presetId, rule] of Object.entries(raw)) {
+            const names = namesOf(rule)
+            if (!isNonEmptyString(presetId) || names.length === 0) continue
+            const set = target.get(presetId) ?? new Set()
+            for (const item of names) set.add(item)
+            target.set(presetId, set)
+        }
+    } catch {
+        /* 读不了或不是 JSON，跳过 */
     }
-    if (rule.denyNames.length === 0 && rule.denyPrefixes.length === 0) return undefined
-    return rule
 }
 
-/** 从 restrict 的报错里把 known global tools 列表抠出来，用于自动纠错。 */
-function parseKnownTools(message) {
-    const matched = /known global tools: ([\s\S]*)$/.exec(String(message ?? ''))
-    if (matched === null) return undefined
-    const listed = matched[1].trim()
-    if (listed === '' || listed === '(none)') return new Set()
-    return new Set(
-        listed
-            .split(',')
-            .map((item) => item.trim())
-            .filter((item) => item !== '')
-    )
+/** v1 的旧文件位置：全局一份 + 每个 profile 一份。 */
+function legacyFiles() {
+    const files = [join(pluginDataDir(), 'rules.json')]
+    try {
+        const profilesDir = join(homeDir(), 'profiles')
+        for (const entry of readdirSync(profilesDir)) {
+            const candidate = join(profilesDir, entry, 'tools-manager', 'rules.json')
+            if (existsSync(candidate)) files.push(candidate)
+        }
+    } catch {
+        /* 没有 profiles 目录就算了 */
+    }
+    return files
 }
 
-function ruleMatches(toolName, rule) {
-    if (rule.denyNames.includes(toolName)) return true
-    return rule.denyPrefixes.some((prefix) => toolName.startsWith(prefix))
+/**
+ * 载入规则。返回 Map<presetId, Set<toolName>>。
+ *
+ * 已经是 v2 就只读主文件；还是 v1 就把所有旧位置并成一份（取并集 —— 多禁一个
+ * 只会挡功能，少禁一个会漏），写回 v2。旧文件原地不动，也不再被读取。
+ */
+function loadRules() {
+    const file = rulesPath()
+    const target = new Map()
+
+    let current
+    try {
+        current = JSON.parse(readFileSync(file, 'utf8'))
+    } catch {
+        current = undefined
+    }
+
+    if (current?.version !== RULES_VERSION) {
+        for (const legacy of legacyFiles()) absorbLegacy(target, legacy)
+        writeRules(target)
+        return target
+    }
+
+    const raw = current?.rules
+    if (raw === null || typeof raw !== 'object') return target
+    for (const [presetId, rule] of Object.entries(raw)) {
+        const names = namesOf(rule)
+        if (!isNonEmptyString(presetId) || names.length === 0) continue
+        target.set(presetId, new Set(names))
+    }
+    return target
 }
+
+/** 全量写盘。返回是否成功。 */
+function writeRules(rules) {
+    const payload = { version: RULES_VERSION, rules: {} }
+    for (const [presetId, names] of rules) {
+        const list = [...names].filter(isNonEmptyString).sort()
+        if (list.length === 0) continue
+        payload.rules[presetId] = { deny: list }
+    }
+    try {
+        mkdirSync(dirname(rulesPath()), { recursive: true })
+        writeFileSync(rulesPath(), JSON.stringify(payload, null, 2), 'utf8')
+        return true
+    } catch {
+        return false
+    }
+}
+
+//#endregion
 
 export function apply(ctx, config) {
-    const source = config ?? {}
-    // 严格模式下访问未 inject 的属性会抛错；日志本身绝不能成为插件启动失败的原因
-    const warn = (line) => {
+    const source = config !== null && typeof config === 'object' ? config : {}
+
+    const log = (level, line) => {
         try {
-            ctx.logger?.warn?.(`[tools-manager] ${line}`)
+            ctx.logger?.[level]?.(`[tools-manager] ${line}`)
         } catch {
-            /* 日志写不了就算了 */
-        }
-    }
-    const info = (line) => {
-        try {
-            ctx.logger?.info?.(`[tools-manager] ${line}`)
-        } catch {
-            /* 同上 */
+            /* 日志写不了不能变成启动失败 */
         }
     }
 
-    // ── 规则存储（按 profile 分开）──────────────────────────────
-    // <home>/profiles/<profile>/tools-manager/ —— 不同 profile 的规则互不干扰，
-    // QQ 模式禁了什么不会连累桌面端标准模式。没有 profile 时才退回 home 级目录。
-    const home = (() => {
-        const base = String(process.env.DSH_HOME ?? '').trim() || join(homedir(), '.dsh')
-        const profile = detectProfileName(ctx)
-        if (profile !== '') return join(base, 'profiles', profile, 'tools-manager')
-        try {
-            const provided = ctx.get?.('dshHomePath')
-            if (typeof provided === 'function') {
-                const resolved = provided('plugin-data', 'tools-manager')
-                if (typeof resolved === 'string' && resolved !== '') return resolved
-            }
-        } catch {
-            /* 拿不到就用下面这个 */
-        }
-        return join(base, 'plugin-data', 'tools-manager')
-    })()
-    const rulesFile = join(home, 'rules.json')
-
-    // 从旧的全局目录迁移一次（只在按 profile 的新位置还没有规则时做，避免覆盖）
-    try {
-        const legacyBase = String(process.env.DSH_HOME ?? '').trim() || join(homedir(), '.dsh')
-        const legacyRules = join(legacyBase, 'plugin-data', 'tools-manager', 'rules.json')
-        if (!existsSync(rulesFile) && existsSync(legacyRules) && legacyRules !== rulesFile) {
-            mkdirSync(home, { recursive: true })
-            writeFileSync(rulesFile, readFileSync(legacyRules), 'utf8')
-        }
-    } catch {
-        /* 迁移失败就当没有，用户重配即可 */
-    }
-
-    const readDiskRules = () => {
-        try {
-            const parsed = JSON.parse(readFileSync(rulesFile, 'utf8'))
-            const raw = parsed?.rules
-            if (raw === null || typeof raw !== 'object') return {}
-            return raw
-        } catch {
-            return {}
-        }
-    }
-
-    const writeDiskRules = (rawRules) => {
-        try {
-            mkdirSync(dirname(rulesFile), { recursive: true })
-            writeFileSync(rulesFile, JSON.stringify({ version: 1, rules: rawRules }, null, 2), 'utf8')
-            return true
-        } catch (error) {
-            warn(`规则写入失败：${error?.message}`)
-            return false
-        }
-    }
-
-    const loadRules = () => {
-        const merged = {}
-        const fromConfig = source.rules !== null && typeof source.rules === 'object' ? source.rules : {}
-        for (const [presetId, raw] of Object.entries(fromConfig)) merged[presetId] = raw
-        for (const [presetId, raw] of Object.entries(readDiskRules())) merged[presetId] = raw
-        const compiled = new Map()
-        for (const [presetId, raw] of Object.entries(merged)) {
-            const rule = normalizeRule(raw)
-            if (rule !== undefined) compiled.set(presetId, rule)
-        }
-        return compiled
-    }
-
-    const fallbackRule = normalizeRule(source.defaultRule)
+    /** Map<presetId, Set<toolName>> */
     let rules = loadRules()
 
-    /** 规则版本号：每次保存 +1。agent 版本落后就在下一次 pre-step 重装。 */
+    /** 规则版本号：每次保存 +1，让滞后安装的 agent 在下一轮 pre-step 重装。 */
     let rulesVersion = 0
 
-    /** 见过的工具名，给设置页列清单（按 agent 视角收集）。 */
-    const catalog = new Set()
-    const catalogFile = join(home, 'catalog.json')
-    let lastCatalogWrite = 0
+    /**
+     * agent → { presetId, rule, handles }
+     *
+     * handles 里是本插件在这个 agent 上装的全部撤销句柄（restrict + guard）。
+     * 重装/卸下时逐个调用，绝不遗留 —— 一旦漏一个，那一层 restriction 会
+     * 一直 deny 到进程退出。
+     */
+    const agents = new Map()
 
-    // 目录落盘：重启后设置页立刻能列出完整清单，不用先聊一句等现场采集
-    try {
-        const stored = JSON.parse(readFileSync(catalogFile, 'utf8'))
-        if (Array.isArray(stored)) {
-            for (const item of stored) if (typeof item === 'string' && item !== '') catalog.add(item)
-        }
-    } catch {
-        // 新位置还没有：把旧的全局清单搬过来（只搬工具名，不涉及规则）
+    /** agent → 上次自愈的时间戳，防止 restrict 抖动时每轮都重装。 */
+    const healedAt = new WeakMap()
+
+    /** sessionId → 上次确认过的 presetId，用于 agent 重建后沿用模式。 */
+    const presetBySession = new Map()
+
+    /** 某个模式的禁用集合；没有专属规则时用兜底。 */
+    const ruleFor = (presetId) => {
+        const own = rules.get(presetId)
+        if (own !== undefined) return own
+        const fallback = rules.get(WILDCARD)
+        if (fallback !== undefined) return fallback
+        const fromConfig = namesOf(source.defaultRule)
+        return fromConfig.length > 0 ? new Set(fromConfig) : new Set()
+    }
+
+    const toolsOf = (agent) => {
+        // ① preset 组自己挂的那份（切模式会重建 scope，agent.ctx 上那份可能作废）
         try {
-            const legacyBase = String(process.env.DSH_HOME ?? '').trim() || join(homedir(), '.dsh')
-            const legacyCatalog = join(legacyBase, 'plugin-data', 'tools-manager', 'catalog.json')
-            if (existsSync(legacyCatalog)) {
-                const stored = JSON.parse(readFileSync(legacyCatalog, 'utf8'))
-                if (Array.isArray(stored)) {
-                    for (const item of stored) if (typeof item === 'string' && item !== '') catalog.add(item)
+            const presets = ctx.get?.('agentPresets')
+            if (typeof presets?.serviceFor === 'function') {
+                const scoped = presets.serviceFor(agent, 'tools')
+                if (scoped !== null && typeof scoped === 'object' && typeof scoped.restrict === 'function') {
+                    return scoped
                 }
             }
         } catch {
-            /* 搬不动就重新采集 */
+            /* 换下一个来源 */
         }
-    }
-
-    const saveCatalog = (force) => {
-        const now = Date.now()
-        if (force !== true && now - lastCatalogWrite < 3000) return
-        lastCatalogWrite = now
+        // ② agent 自己的 ctx —— 官方 subagent 走的就是这条
         try {
-            mkdirSync(home, { recursive: true })
-            writeFileSync(catalogFile, JSON.stringify([...catalog].sort(), null, 2), 'utf8')
-        } catch {
-            /* 写不了不影响主流程 */
-        }
-    }
-
-    /** agent → 自愈重试次数（防止限制一直丢失时无限重装） */
-    const healAttempts = new Map()
-
-    /** agent → { presetId, version, fiber, sync, reset, collect, needsHeal } */
-    const agents = new Map()
-
-    /**
-     * fiber.dispose() 可能同步返回、也可能返回 Promise。
-     * 同步 try 接不住 Promise 的 reject，而返回值是 undefined 时 `.catch?.()` 又会抛 TypeError，
-     * 所以统一走这里，两种情况都吞掉 —— 销毁失败不该连累插件。
-     */
-    const safeDispose = (fiber) => {
-        try {
-            const result = fiber?.dispose?.()
-            if (result !== null && result !== undefined && typeof result.catch === 'function') {
-                result.catch(() => {})
+            const direct = agent?.ctx?.tools
+            if (direct !== null && typeof direct === 'object' && typeof direct.restrict === 'function') {
+                return direct
             }
         } catch {
-            /* 忽略 */
+            /* 属性访问可能抛错 */
+        }
+        return undefined
+    }
+
+    /** 一个 agent 当前真正看得见的工具名。restrict 生效后，被禁的那些不在这里。 */
+    const visibleNames = (agent, tools) => {
+        try {
+            const schemas = tools.schemas(agent)
+            if (!Array.isArray(schemas)) return undefined
+            const names = new Set()
+            for (const schema of schemas) if (isNonEmptyString(schema?.name)) names.add(schema.name)
+            return names
+        } catch {
+            return undefined
         }
     }
 
-    /**
-     * sessionId → 上次确认过的 presetId。
-     * agent 实例可能被重建（重建后 composedPreset 有一段查不到的窗口），靠它跨实例沿用，
-     * 否则每次重建都会先退回 standard、把限制全撤掉，看起来就是工具忽然又全回来了。
-     */
-    const lastPresetBySession = new Map()
-
-    const ruleFor = (presetId) => rules.get(presetId) ?? rules.get('*') ?? fallbackRule
-
-    /**
-     * 读一个 agent 真正在用的 preset id。
-     *
-     * 权威来源是 agentPresets.composedPreset(agent.ctx) —— 直接查这个 agent 挂载的组合
-     * （官方原话：Read the preset a live Agent uses）。header.agentPreset 只是创建时的
-     * 初值，像 QQ 机器人这种自己 mount preset 的，header 里留的还是 standard，靠它会认错模式。
-     *
-     * ⚠ 判定要「粘」：composedPreset 在某些时刻会查不到（generation 没就绪），这时**必须沿用
-     *   上一次确认过的 id**，不能退回 header 猜的值。否则会 一会有规则→撤销→再有规则 地来回抖，
-     *   表现就是「重启后工具变少，聊一句又全回来了」。
-     */
-    const resolvePresetId = (agent, previous) => {
+    const resolvePreset = (agent, fallback) => {
         try {
             const presets = ctx.get?.('agentPresets')
             if (typeof presets?.composedPreset === 'function') {
-                const composed = presets.composedPreset(agent.ctx)
-                if (typeof composed === 'string' && composed !== '') return { id: composed, source: 'composedPreset' }
+                const id = presets.composedPreset(agent.ctx)
+                if (isNonEmptyString(id)) return id
             }
-        } catch (error) {
+        } catch {
+            /* 查不到就往后退 */
         }
-        if (previous !== undefined && previous !== '') return { id: previous, source: 'cached' }
+        if (isNonEmptyString(fallback)) return fallback
         const header = agent?.session?.header
-        const fromHeader = typeof header?.agentPreset === 'string' && header.agentPreset !== '' ? header.agentPreset : ''
-        if (fromHeader !== '') return { id: fromHeader, source: 'header' }
-        return { id: 'standard', source: 'default' }
+        if (isNonEmptyString(header?.agentPreset)) return header.agentPreset
+        return 'standard'
     }
 
-    const install = (agent) => {
+    /** 卸掉本插件在这个 agent 上装的一切。幂等。 */
+    const unmount = (agent) => {
+        const state = agents.get(agent)
+        if (state === undefined) return
+        agents.delete(agent)
+        for (const dispose of state.handles) {
+            try {
+                dispose()
+            } catch {
+                /* 撤销失败也要继续撤后面的 */
+            }
+        }
+        state.handles.length = 0
+    }
+
+    /**
+     * 装一次。顺序永远是：先全撤，再全装。
+     *
+     * restrict 只拿「当前可见 ∩ 规则」—— restrict 会校验名字，规则里那些
+     * 这一刻还不存在的工具传进去会直接抛错。guard 则用完整规则：工具可能在
+     * 一轮对话中途才注册，那会儿模型已经能看见它了，得靠 guard 兜住。
+     */
+    const mount = (agent) => {
         if (agent === null || typeof agent !== 'object') return
-        if (agents.has(agent)) return
         const header = agent?.session?.header
         if (header === undefined || header === null) return
 
-        const sessionId = typeof header.id === 'string' ? header.id : ''
-        const resolved = resolvePresetId(agent, sessionId === '' ? undefined : lastPresetBySession.get(sessionId))
-        const presetId = resolved.id
-        if (sessionId !== '') lastPresetBySession.set(sessionId, presetId)
+        const sessionId = isNonEmptyString(header.id) ? header.id : ''
+        const previous = agents.get(agent)
+        const presetId = resolvePreset(agent, previous?.presetId ?? (sessionId === '' ? undefined : presetBySession.get(sessionId)))
+        if (sessionId !== '') presetBySession.set(sessionId, presetId)
 
-        const state = {
-            presetId,
-            version: rulesVersion,
-            fiber: undefined,
-            sync: () => {},
-            reset: () => {},
-            collect: () => [],
-            needsHeal: () => false
+        unmount(agent)
+
+        const rule = ruleFor(presetId)
+        const handles = []
+        const tools = toolsOf(agent)
+
+        // 拿不到 tools 就不记状态 —— 下一轮 pre-step 会再试一次。
+        // 记成"已装"的话这个会话就永远失联了。
+        if (tools === undefined) {
+            log('warn', `[${presetId}] 拿不到 tools 服务，这个会话暂时不做限制`)
+            return
         }
-        let currentRule = ruleFor(presetId)
 
-        // 两个候选作用域：inject 回调的 scope（官方 installPrompt 的用法）与 agent.ctx
-        // 本身（官方 applyChildOverrides 的用法）。哪个能让 restrict 通过就用哪个 ——
-        // 这决定了限制落在 agent 上还是落在派生 scope 上，不能想当然。
-        state.fiber = agent.ctx.inject(['tools'], (injected) => {
-            const candidates = []
-            const pushCandidate = (label, tools) => {
-                try {
-                    if (tools !== undefined && tools !== null && typeof tools.restrict === 'function') {
-                        candidates.push({ label, tools })
-                    }
-                } catch {
-                    /* 属性访问可能抛错 */
-                }
-            }
-            // ① preset 组内的 tools 服务 —— 官方 serviceFor 就是为「取 Agent preset 组里的服务」设计的。
-            //    运行时切 preset 会重建 scope 链，agent.ctx 上那个多半已经作废，这个是当前 mount 的。
+        const visible = visibleNames(agent, tools)
+        const deny = visible === undefined ? [] : [...rule].filter((item) => visible.has(item))
+
+        if (deny.length > 0) {
             try {
-                const presets = ctx.get?.('agentPresets')
-                if (typeof presets?.serviceFor === 'function') {
-                    pushCandidate('preset-service', presets.serviceFor(agent, 'tools'))
-                }
+                const dispose = tools.restrict({ deny })
+                if (typeof dispose === 'function') handles.push(dispose)
             } catch (error) {
+                log('warn', `[${presetId}] restrict 没装上（${error?.message}），改由 guard 拦截`)
             }
-            // ② agent 自己的 ctx
+        }
+
+        if (rule.size > 0) {
             try {
-                pushCandidate('agent.ctx', agent.ctx?.tools)
-            } catch {
-                /* 属性访问可能抛错 */
+                const dispose = tools.guard((exec) => {
+                    const called = isNonEmptyString(exec?.name) ? exec.name : ''
+                    if (called === '' || !rule.has(called)) return undefined
+                    return `工具「${called}」在「${presetId}」模式下已被禁用（dsh-tools-manager）`
+                })
+                if (typeof dispose === 'function') handles.push(dispose)
+            } catch (error) {
+                log('warn', `[${presetId}] guard 没装上：${error?.message}`)
             }
-            // ③ inject 回调派生的 scope
-            try {
-                pushCandidate('inject-scope', injected?.tools)
-            } catch {
-                /* 同上 */
-            }
-            if (candidates.length === 0) {
-                warn(`[${presetId}] 拿不到 tools 服务，跳过`)
-                return
-            }
+        }
 
-            let denied = new Set()
-            const unrestrictable = new Set()
-            let dispose
+        if (deny.length > 0) log('info', `[${presetId}] 已禁 ${deny.length} 个：${deny.join(' ')}`)
 
-            const readSchemas = (tools) => {
-                try {
-                    const direct = tools.schemas(agent)
-                    if (Array.isArray(direct)) return direct
-                } catch {
-                    /* 换下一个形式 */
-                }
-                try {
-                    const plain = tools.schemas()
-                    if (Array.isArray(plain)) return plain
-                } catch {
-                    /* 两个形式都不行就当没有 */
-                }
-                return undefined
-            }
-
-            const visibleNames = () => {
-                let schemas
-                for (const candidate of candidates) {
-                    schemas = readSchemas(candidate.tools)
-                    if (schemas !== undefined) break
-                }
-                if (!Array.isArray(schemas)) return []
-                const names = []
-                for (const schema of schemas) {
-                    const name = schema?.name
-                    if (typeof name === 'string' && name !== '') names.push(name)
-                }
-                let fresh = 0
-                for (const name of names) {
-                    if (!catalog.has(name)) {
-                        catalog.add(name)
-                        fresh += 1
-                    }
-                }
-                if (fresh > 0) saveCatalog()
-                return names
-            }
-            state.collect = visibleNames
-
-            /**
-             * 按候选顺序试 restrict。两条判据缺一不可：
-             *   a) 不抛错（作用域被认）；
-             *   b) 限制后重读 schemas，被 deny 的名字真的消失了。
-             * 只满足 a 不满足 b 就是「静默无效」—— 派生的子 scope 会照单全收，
-             * 但限制根本不落在 agent 上，这是我们反复踩的那个坑。
-             */
-            const tryRestrict = (filter) => {
-                const errors = []
-                for (const candidate of candidates) {
-                    let handle
-                    try {
-                        handle = candidate.tools.restrict(filter)
-                    } catch (error) {
-                        errors.push(`${candidate.label}: ${error?.message}`)
-                        continue
-                    }
-                    const schemas = readSchemas(candidate.tools)
-                    if (Array.isArray(schemas)) {
-                        const stillThere = schemas
-                            .map((schema) => schema?.name)
-                            .filter((name) => typeof name === 'string' && filter.deny.includes(name))
-                        if (stillThere.length > 0) {
-                            errors.push(`${candidate.label}: 未生效（${stillThere.length} 个仍在）`)
-                            try {
-                                if (typeof handle === 'function') handle()
-                            } catch {
-                                /* 撤销失败就留着 */
-                            }
-                            continue
-                        }
-                    }
-                    info(`[${presetId}] 已遮蔽 ${filter.deny.length} 个（via ${candidate.label}）：${filter.deny.join(' ')}`)
-                    // 关键：限制是在 recompose 之后才加上的，而 recompose 的 tools/change 早就发完了。
-                    // 补发一次，逼会话按新的（受限的）工具集重算，否则它还用切换时算好的那份 40 个。
-                    try {
-                        ctx.emit?.('tools/change')
-                    } catch {
-                        /* 拿不到事件总线就算了 */
-                    }
-                    return { handle, label: candidate.label }
-                }
-                return { handle: undefined, errors }
-            }
-
-            const applyRestriction = () => {
-                const previous = dispose
-                // 只有 deny：不传 allow，别去掺和「哪些该保留」——那是别的插件的事
-                const filter = { deny: [...denied] }
-                dispose = undefined
-                const outcome = tryRestrict(filter)
-                if (outcome.handle !== undefined) {
-                    dispose = outcome.handle
-                    return
-                }
-                // 报错里带 known global tools 时，说明名单里有不可限制的名字，剔除后重试一次
-                const known =
-                    outcome.errors === undefined ? undefined : parseKnownTools(outcome.errors.join(' '))
-                if (known === undefined) {
-                    warn(`[${presetId}] restrict 失败：${(outcome.errors ?? []).join(' | ')}`)
-                    dispose = previous
-                    return
-                }
-                for (const name of [...denied]) {
-                    if (!known.has(name)) {
-                        unrestrictable.add(name)
-                        denied.delete(name)
-                    }
-                }
-                if (denied.size === 0) {
-                    warn(`[${presetId}] 名单里没有可限制的工具，这次不遮蔽（known 共 ${known.size} 个）`)
-                    dispose = previous
-                    return
-                }
-                const retry = tryRestrict({ deny: [...denied] })
-                if (retry.handle !== undefined) {
-                    dispose = retry.handle
-                } else {
-                    warn(`[${presetId}] restrict 重试仍失败：${(retry.errors ?? []).join(' | ')}`)
-                    dispose = previous
-                }
-            }
-
-            // 自愈探针：切换 preset 会重建 layer，restriction 可能整条丢掉，
-            // 症状就是「本该遮蔽的工具又出现在 schemas 里」。
-            state.needsHeal = () => {
-                if (denied.size === 0) return false
-                const names = visibleNames()
-                if (names.length === 0) return false
-                return [...denied].some((name) => names.includes(name))
-            }
-
-            // 只增不减，避免 schemas() 反映 restriction 后造成震荡
-            state.sync = () => {
-                const names = visibleNames()
-                if (currentRule === undefined || names.length === 0) return
-                let added = 0
-                for (const toolName of names) {
-                    if (unrestrictable.has(toolName)) continue
-                    if (denied.has(toolName)) continue
-                    if (!ruleMatches(toolName, currentRule)) continue
-                    denied.add(toolName)
-                    added += 1
-                }
-                if (added === 0 && dispose !== undefined) return
-                if (denied.size === 0) return
-                applyRestriction()
-            }
-
-            // 全量重算：唯一允许减少的路径（设置页保存后走这里）
-            state.reset = (nextRule) => {
-                currentRule = nextRule
-                if (dispose !== undefined) {
-                    try {
-                        dispose()
-                    } catch {
-                        /* 撤销失败不影响重装 */
-                    }
-                }
-                dispose = undefined
-                denied = new Set()
-                unrestrictable.clear()
-                if (currentRule === undefined) {
-                    info(`[${presetId}] 规则已清空，工具全部恢复可见`)
-                    return
-                }
-                for (const toolName of visibleNames()) {
-                    if (ruleMatches(toolName, currentRule)) denied.add(toolName)
-                }
-                if (denied.size === 0) {
-                    info(`[${presetId}] 无匹配项，不遮蔽`)
-                    return
-                }
-                applyRestriction()
-            }
-
-            const initial = visibleNames()
-            info(
-                `[${presetId}] 接管 agent，可见 ${initial.length} 个工具` +
-                    (currentRule === undefined ? '（该模式无规则，全放行）' : '')
-            )
-            if (currentRule !== undefined) state.sync()
-        })
-
-        agents.set(agent, state)
+        agents.set(agent, { presetId, rule, handles, version: rulesVersion })
     }
 
-    /** 规则变了：版本号 +1 并立刻重装已知 agent；漏网的会在下一次 pre-step 补上。 */
-    const reapplyAll = () => {
+    /**
+     * 每轮检查一次：没装的补上、模式变了的重装、规则变了的重装、
+     * restriction 被重建掉的重新贴回去。
+     */
+    const ensure = (agent) => {
+        const state = agents.get(agent)
+        const presetId = resolvePreset(agent, state?.presetId)
+        if (state === undefined || state.presetId !== presetId) {
+            if (state !== undefined) log('info', `[${state.presetId}] → [${presetId}]，重装`)
+            mount(agent)
+            return
+        }
+        if (state.version !== rulesVersion) {
+            mount(agent)
+            return
+        }
+        if (state.rule.size === 0) return
+
+        // 自愈：被禁的名字又出现在可见集里，说明切 preset 重建 scope 时
+        // restriction 整条丢了。节流 5 秒，避免和 tools/change 打架。
+        const now = Date.now()
+        if (now - (healedAt.get(agent) ?? 0) < 5000) return
+        const tools = toolsOf(agent)
+        if (tools === undefined) return
+        const visible = visibleNames(agent, tools)
+        if (visible === undefined || visible.size === 0) return
+        for (const denied of state.rule) {
+            if (!visible.has(denied)) continue
+            healedAt.set(agent, now)
+            log('info', `[${presetId}] 「${denied}」又露出来了，重新贴限制`)
+            mount(agent)
+            return
+        }
+    }
+
+    /** 规则变了：所有 agent 重装。 */
+    const remountAll = () => {
         rulesVersion += 1
-        for (const [agent, state] of agents) {
+        for (const agent of [...agents.keys()]) {
             try {
-                state.version = rulesVersion
-                state.reset(ruleFor(state.presetId))
+                mount(agent)
             } catch (error) {
-                warn(`重装 ${state.presetId} 失败：${error?.message}`)
+                log('warn', `重装失败：${error?.message}`)
             }
         }
     }
 
     ctx.on('agent/created', ({ agent }) => {
         try {
-            install(agent)
+            mount(agent)
         } catch (error) {
-            warn(`agent/created 处理失败：${error?.message}`)
+            log('warn', `agent/created 处理失败：${error?.message}`)
         }
     })
 
-    // 主通道：插件可能比会话起得晚（agent/created 早过去了），每轮都补装/补同步。
+    // 插件可能比会话起得晚（agent/created 早过去了），每轮补一次。
     ctx.on('agent/pre-step', async (payload, next) => {
         const decision = await next()
         const agent = payload?.agent
         if (agent === undefined || agent === null) return decision
         try {
-            install(agent)
-            const state = agents.get(agent)
-            if (state === undefined) return decision
-            // agent 创建之后才 mount preset 的情况（QQ 机器人就是这样），这里补正模式。
-            // 传 state.presetId 作为 previous：查不到 composedPreset 时沿用上次，不抖。
-            const resolved = resolvePresetId(agent, state.presetId)
-            if (resolved.id !== state.presetId) {
-                const sessionId = typeof agent?.session?.header?.id === 'string' ? agent.session.header.id : ''
-                if (sessionId !== '') lastPresetBySession.set(sessionId, resolved.id)
-                // 切 preset 会重建 scope：旧 fiber 里的候选 ctx 全部作废，复用等于把限制打在
-                // 一个没人用的 scope 上（表现就是「切换后禁用不生效」，默认就是该模式则正常）。
-                // 所以这里不复用，直接销毁重装，让 install 重新取一遍 agent.ctx。
-                agents.delete(agent)
-                safeDispose(state.fiber)
-                install(agent)
-                return decision
-            }
-            if (state.version !== rulesVersion) {
-                state.version = rulesVersion
-                state.reset(ruleFor(state.presetId))
-            } else {
-                state.sync()
-                // 自愈：切换 preset 重建 layer 后，已加上的 restriction 会整条丢失，
-                // 表现为本该被遮蔽的工具又回到 schemas 里。这里重新接管一次（限量，防死循环）。
-                try {
-                    // 用时间窗节流而不是次数上限：切换导致的丢失可能反复发生，
-                    // 次数用光就再也不修了；改成「5 秒内不重复重装」，既能持续自愈也不会狂刷。
-                    const lastHeal = healAttempts.get(agent) ?? 0
-                    const now = Date.now()
-                    if (
-                        now - lastHeal > 5000 &&
-                        typeof state.needsHeal === 'function' &&
-                        state.needsHeal()
-                    ) {
-                        healAttempts.set(agent, now)
-                        agents.delete(agent)
-                        safeDispose(state.fiber)
-                        install(agent)
-                    }
-                } catch (error) {
-                }
-            }
+            ensure(agent)
         } catch (error) {
-            warn(`pre-step 同步失败：${error?.message}`)
+            log('warn', `pre-step 检查失败：${error?.message}`)
         }
         return decision
     })
 
     ctx.on('agent/disposed', ({ agent }) => {
-        const state = agents.get(agent)
-        healAttempts.delete(agent)
-        if (state === undefined) return
-        agents.delete(agent)
-        safeDispose(state.fiber)
+        unmount(agent)
     })
 
-    /**
-     * 真正的拦截层。
-     *
-     * 实测结论：restrict() 在真机上只改了「agent 视角的 schemas」，模型对话请求里
-     * 仍然是全量 40 个工具（会话日志可以作证）。所以光靠 restrict 藏不住。
-     *
-     * tools/pre-execute 是全局 waterfall，不看 scope，`exec.agent` 直接给出调用方 ——
-     * 用它保证「禁了就用不了」。官方文档也是这么分工的：
-     *   Hiding tools from one agent is ctx.tools.restrict() ...
-     *   a denial that must hold regardless of order / must await → tools/pre-execute
-     */
-    ctx.on('tools/pre-execute', async (exec, next) => {
-        try {
-            const toolName = typeof exec?.name === 'string' ? exec.name : ''
-            const agent = exec?.agent
-            if (toolName !== '' && agent !== undefined && agent !== null) {
-                const sessionId = typeof agent?.session?.header?.id === 'string' ? agent.session.header.id : ''
-                const resolved = resolvePresetId(
-                    agent,
-                    sessionId !== '' ? lastPresetBySession.get(sessionId) : undefined
-                )
-                const rule = ruleFor(resolved.id)
-                if (rule !== undefined && ruleMatches(toolName, rule)) {
-                    return {
-                        kind: 'deny',
-                        reason: `工具「${toolName}」在「${resolved.id}」模式下已被禁用（dsh-tools-manager）`,
-                        info: { name: 'TOOL_DISABLED_BY_MANAGER', code: 'TOOL_DISABLED' }
-                    }
-                }
-            }
-        } catch (error) {
-        }
-        return next()
-    }, { prepend: true })
-
-    // ── 设置页接口 ──────────────────────────────────────────────
-    const listPresets = async () => {
-        try {
-            const service = ctx.get?.('agentPresets')
-            if (typeof service?.remoteExportList === 'function') {
-                const listed = await service.remoteExportList()
-                const presets = Array.isArray(listed?.presets) ? listed.presets : []
-                if (presets.length > 0) {
-                    return presets
-                        .filter((item) => typeof item?.id === 'string' && item.id !== '')
-                        .map((item) => ({
-                            id: item.id,
-                            name: typeof item.name === 'string' && item.name !== '' ? item.name : item.id,
-                            description: typeof item.description === 'string' ? item.description : ''
-                        }))
-                }
-            }
-        } catch (error) {
-            warn(`读取模式名册失败：${error?.message}`)
-        }
-        const ids = new Set([...BUILTIN_PRESETS, ...rules.keys()].filter((id) => id !== '*'))
-        return [...ids].map((id) => ({ id, name: id, description: '' }))
-    }
-
-    const listAllTools = () => {
-        for (const state of agents.values()) {
-            try {
-                state.collect?.()
-            } catch {
-                /* 单个 agent 采不到不影响其它 */
-            }
-        }
-        if (catalog.size === 0) {
-            try {
-                const service = ctx.get?.('tools')
-                if (typeof service?.schemas === 'function') {
-                    const schemas = service.schemas()
-                    if (Array.isArray(schemas)) {
-                        for (const schema of schemas) {
-                            if (typeof schema?.name === 'string' && schema.name !== '') catalog.add(schema.name)
-                        }
-                    }
-                }
-            } catch {
-                /* 兜底失败就空着，等第一条消息自己采 */
-            }
-        }
-        return [...catalog].sort()
-    }
-
-    const ruleToWire = (rule) => ({
-        denyNames: rule?.denyNames ?? [],
-        denyPrefixes: rule?.denyPrefixes ?? []
-    })
+    //#region 设置页接口
 
     const json = (res, status, payload) => {
         res.statusCode = status
@@ -760,13 +411,103 @@ export function apply(ctx, config) {
         res.end(JSON.stringify(payload))
     }
 
-    const handleState = async (res) => {
+    const listPresets = async () => {
+        const out = []
+        try {
+            const service = ctx.get?.('agentPresets')
+            if (typeof service?.remoteExportList === 'function') {
+                const listed = await service.remoteExportList()
+                for (const item of Array.isArray(listed?.presets) ? listed.presets : []) {
+                    if (!isNonEmptyString(item?.id)) continue
+                    out.push({
+                        id: item.id,
+                        name: isNonEmptyString(item.name) ? item.name : item.id,
+                        description: typeof item.description === 'string' ? item.description : ''
+                    })
+                }
+            }
+        } catch (error) {
+            log('warn', `读取模式名册失败：${error?.message}`)
+        }
+        if (out.length === 0) {
+            for (const id of new Set([...BUILTIN_PRESETS, ...rules.keys()])) {
+                if (id === WILDCARD) continue
+                out.push({ id, name: id, description: '' })
+            }
+        }
+        if (!out.some((item) => item.id === WILDCARD)) {
+            out.push({ id: WILDCARD, name: '兜底（所有模式）', description: '没有单独配置的模式都落到这条' })
+        }
+        return out
+    }
+
+    /** 该 preset 下所有存活 agent 的可见工具并集。 */
+    const liveTools = (presetId) => {
+        const visible = new Set()
+        let sessions = 0
+        for (const [agent, state] of agents) {
+            if (state.presetId !== presetId) continue
+            sessions += 1
+            const tools = toolsOf(agent)
+            if (tools === undefined) continue
+            const names = visibleNames(agent, tools)
+            if (names === undefined) continue
+            for (const item of names) visible.add(item)
+        }
+        return { visible, sessions }
+    }
+
+    /**
+     * 一个模式没有存活会话时，只能退到「全局注册了什么」——
+     * 那是「注册过」不是「这个模式有」，所以单独标出来，让界面说清楚。
+     */
+    const globalTools = () => {
+        const visible = new Set()
+        try {
+            const service = ctx.get?.('tools')
+            if (typeof service?.schemas === 'function') {
+                const schemas = service.schemas()
+                if (Array.isArray(schemas)) {
+                    for (const schema of schemas) if (isNonEmptyString(schema?.name)) visible.add(schema.name)
+                }
+            }
+        } catch {
+            /* 拿不到就空着 */
+        }
+        return visible
+    }
+
+    const handleState = async (res, wanted) => {
         const presets = await listPresets()
-        const tools = listAllTools()
-        saveCatalog(true)
-        const wireRules = {}
-        for (const [presetId, rule] of rules) wireRules[presetId] = ruleToWire(rule)
-        json(res, 200, { ok: true, presets, tools, rules: wireRules, rulesFile })
+        const presetId = presets.some((item) => item.id === wanted) ? wanted : presets[0]?.id ?? ''
+
+        const { visible, sessions } = liveTools(presetId)
+        let unverified = false
+        if (sessions === 0) {
+            unverified = true
+            for (const item of globalTools()) visible.add(item)
+        }
+
+        const rule = rules.get(presetId) ?? new Set()
+        // 清单 = 这个模式现在看得见的 ∪ 规则里点名要禁的。
+        // 不再有第三个来源 —— 历史目录那种「以前见过」的东西全部不算数。
+        const names = new Set([...visible, ...rule])
+
+        const tools = [...names].sort().map((item) => ({
+            name: item,
+            visible: visible.has(item),
+            denied: rule.has(item)
+        }))
+
+        json(res, 200, {
+            ok: true,
+            presets,
+            presetId,
+            sessions,
+            unverified,
+            tools,
+            rulesFile: rulesPath()
+        })
     }
 
     const handleSave = async (req, res) => {
@@ -779,46 +520,46 @@ export function apply(ctx, config) {
             json(res, 400, { ok: false, error: `请求体不是 JSON：${error?.message}` })
             return
         }
-        const incoming = body?.rules
-        if (incoming === null || typeof incoming !== 'object') {
-            json(res, 400, { ok: false, error: '缺少 rules' })
+        const presetId = body?.presetId
+        if (!isNonEmptyString(presetId)) {
+            json(res, 400, { ok: false, error: '缺少 presetId' })
             return
         }
-        const stored = {}
-        for (const [presetId, raw] of Object.entries(incoming)) {
-            if (raw === null || typeof raw !== 'object') continue
-            const clean = {
-                denyNames: stringsOf(raw.denyNames),
-                denyPrefixes: stringsOf(raw.denyPrefixes)
-            }
-            if (clean.denyNames.length === 0 && clean.denyPrefixes.length === 0) continue
-            stored[presetId] = clean
-        }
-        if (!writeDiskRules(stored)) {
-            json(res, 500, { ok: false, error: '规则写入失败，看 Host 日志' })
+        if (!Array.isArray(body?.deny)) {
+            json(res, 400, { ok: false, error: '缺少 deny 数组' })
             return
         }
-        rules = loadRules()
-        reapplyAll()
-        info(`规则已更新：${Object.keys(stored).join(', ') || '(全部清空)'}`)
+
+        // 单模式粒度写入：只碰这一个 preset，不拿整份 draft 覆盖别人。
+        const next = new Set(body.deny.filter(isNonEmptyString).map((item) => item.trim()))
+        if (next.size === 0) rules.delete(presetId)
+        else rules.set(presetId, next)
+
+        if (!writeRules(rules)) {
+            json(res, 500, { ok: false, error: `写不进 ${rulesPath()}，看 Host 日志` })
+            return
+        }
+        remountAll()
+        log('info', `[${presetId}] 规则已保存：${next.size === 0 ? '(空)' : [...next].join(' ')}`)
         json(res, 200, { ok: true })
     }
 
-    const disposeApi = (() => {
-        try {
-            const webServer = ctx.get?.('webServer')
-            if (webServer === undefined || typeof webServer.register !== 'function') {
-                warn('Host 没有 webServer 服务，设置页接口不注册（过滤逻辑照常工作）')
-                return undefined
-            }
-            const dispose = webServer.register({
+    let disposeApi
+    try {
+        const webServer = ctx.get?.('webServer')
+        if (webServer === undefined || typeof webServer.register !== 'function') {
+            log('warn', 'Host 没有 webServer 服务，设置页接口不注册（禁用逻辑照常工作）')
+        } else {
+            disposeApi = webServer.register({
                 kind: 'prefix',
                 path: API_PREFIX,
                 handler: async (req, res) => {
                     const url = new URL(req.url ?? '/', 'http://localhost')
                     const route = url.pathname.slice(API_PREFIX.length) || '/'
                     try {
-                        if (route === '/state' && (req.method ?? 'GET') === 'GET') return await handleState(res)
+                        if (route === '/state' && (req.method ?? 'GET') === 'GET') {
+                            return await handleState(res, url.searchParams.get('preset') ?? '')
+                        }
                         if (route === '/rules' && req.method === 'POST') return await handleSave(req, res)
                         json(res, 404, { ok: false, error: `未知接口 ${req.method} ${route}` })
                     } catch (error) {
@@ -826,17 +567,22 @@ export function apply(ctx, config) {
                     }
                 }
             })
-            info(`设置页接口已注册：${API_PREFIX}`)
-            return dispose
-        } catch (error) {
-            warn(`设置页接口注册失败：${error?.message}`)
-            return undefined
+            log('info', `设置页接口已注册：${API_PREFIX}`)
         }
-    })()
+    } catch (error) {
+        log('warn', `设置页接口注册失败：${error?.message}`)
+    }
+
+    //#endregion
 
     ctx.effect?.(() => () => {
-        for (const state of agents.values()) safeDispose(state.fiber)
-        agents.clear()
-        if (typeof disposeApi === 'function') disposeApi()
+        for (const agent of [...agents.keys()]) unmount(agent)
+        if (typeof disposeApi === 'function') {
+            try {
+                disposeApi()
+            } catch {
+                /* 关不掉也无所谓 */
+            }
+        }
     }, 'tools-manager cleanup')
 }

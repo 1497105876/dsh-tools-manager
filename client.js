@@ -1,16 +1,15 @@
 /**
  * @gw/dsh-tools-manager 浏览器端：设置页。
  *
- * 布局（就是你要的样子）：左栏「已启用」、右栏「已禁用」，点条目即可在两栏之间来回搬。
- *   · 顶部：模式选择（下拉）+ 刷新 + 保存；保存前有改动才亮。
- *   · 每栏：标题 + 计数 + 搜索框；整行可点，悬停高亮。
- *   · 由 denyPrefixes（前缀规则）命中的工具也显示在右栏，带「前缀」徽章 —— 那种不能在
- *     这儿放开，得改 cordis.patch.yml 里的前缀（否则会给你一个"点了没反应"的假象）。
+ * 只有一张表：一个工具一行，右边一个「禁用」开关。
  *
- * 为什么全用原生控件：宿主原语（Button / Switch…）在不同版本里名字和 props 都可能变，
- * 拿不到就白屏。这里只用 React + 令牌样式，稳。
+ * 这里刻意没有「已启用」这一栏。dsh 里工具能不能用取决于 preset 挂载了哪些
+ * 插件、group 有没有 disabled、有没有被别的插件 restrict —— 本插件一概不知，
+ * 也管不着。硬把「不在我的黑名单里」说成「已启用」就是在编。
  *
- * 数据通道：同源 fetch 到 Host 的 /api/plugins/tools-manager（index.js 里注册）。
+ * 所以每行只有两个事实：
+ *   denied    本插件禁了它没有（开关状态）
+ *   visible   这个模式现在看不看得见（只读，来自存活 agent 的 schemas）
  */
 
 window.__ModuleLoader__.load({
@@ -35,7 +34,6 @@ window.__ModuleLoader__.load({
     const h = React.createElement
     const { useState, useEffect, useCallback, useMemo } = React
 
-    // ── 请求 ────────────────────────────────────────────────────
     async function request(path, init) {
       const response = await fetch(`${API}${path}`, {
         credentials: 'same-origin',
@@ -53,84 +51,71 @@ window.__ModuleLoader__.load({
       return data
     }
 
-    // ── 样式（一次性注入，全吃官方令牌，令牌缺失时退回硬编码浅色） ──
     function ensureStyles() {
       if (typeof document === 'undefined') return
       if (document.getElementById(`${NS}-styles`) !== null) return
       const style = document.createElement('style')
       style.id = `${NS}-styles`
       style.textContent = `
-.tm-page{display:flex;flex-direction:column;gap:14px;color:var(--dsw-alias-label-primary,#15171a);font-family:var(--dsw-font-family,inherit);font-size:13px;line-height:1.6}
-.tm-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.tm-page{display:flex;flex-direction:column;gap:12px;color:var(--dsw-alias-label-primary,#15171a);font-family:var(--dsw-font-family,inherit);font-size:13px;line-height:1.6}
+.tm-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .tm-title{font-size:15px;font-weight:600;margin:0}
-.tm-hint{color:var(--dsw-alias-label-tertiary,#6b7280);font-size:12px}
 .tm-spacer{flex:1}
-.tm-select{height:32px;padding:0 8px;border:.5px solid var(--dsw-alias-border-l3,rgba(0,0,0,.12));border-radius:8px;background:var(--dsw-alias-bg-layer-1,#fff);color:inherit;font:inherit}
-.tm-btn{height:30px;padding:0 12px;border-radius:8px;border:.5px solid var(--dsw-alias-border-l3,rgba(0,0,0,.12));background:var(--dsw-alias-bg-layer-1,#fff);color:inherit;font:inherit;cursor:pointer;transition:background .12s ease}
+.tm-select{height:30px;padding:0 8px;border:.5px solid var(--dsw-alias-border-l3,rgba(0,0,0,.12));border-radius:8px;background:var(--dsw-alias-bg-layer-1,#fff);color:inherit;font:inherit;font-size:12px}
+.tm-btn{height:28px;padding:0 11px;border-radius:8px;border:.5px solid var(--dsw-alias-border-l3,rgba(0,0,0,.12));background:var(--dsw-alias-bg-layer-1,#fff);color:inherit;font:inherit;font-size:12px;cursor:pointer;transition:background .12s ease}
 .tm-btn:hover:not(:disabled){background:var(--dsw-alias-bg-module-platform,#f5f6f7)}
-.tm-btn.primary{background:var(--dsw-alias-brand-primary,#15171a);border-color:transparent;color:var(--dsw-alias-label-primary-foreground,#fff)}
-.tm-btn.danger:hover:not(:disabled){color:var(--dsw-alias-label-error,#bb0000);border-color:currentColor}
 .tm-btn:disabled{opacity:.42;cursor:not-allowed}
-.tm-cols{display:grid;grid-template-columns:1fr 1fr;gap:12px;align-items:stretch}
-@media (max-width:760px){.tm-cols{grid-template-columns:1fr}}
-.tm-col{display:flex;flex-direction:column;min-height:340px;overflow:hidden;border:.5px solid var(--dsw-alias-border-l3,rgba(0,0,0,.12));border-radius:12px;background:var(--dsw-alias-bg-layer-1,#fff)}
-.tm-col-head{display:flex;align-items:center;gap:8px;padding:9px 12px;border-bottom:.5px solid var(--dsw-alias-border-l3,rgba(0,0,0,.12));background:var(--dsw-alias-bg-module-platform,#f5f6f7)}
-.tm-col-title{font-weight:600}
-.tm-count{font-size:12px;color:var(--dsw-alias-label-tertiary,#6b7280)}
-.tm-search{margin-left:auto;width:110px;height:26px;padding:0 8px;border-radius:6px;border:.5px solid var(--dsw-alias-border-l3,rgba(0,0,0,.12));background:var(--dsw-alias-bg-layer-1,#fff);color:inherit;font:inherit;font-size:12px}
-.tm-list{flex:1;overflow:auto;padding:6px;display:flex;flex-direction:column;gap:2px}
-.tm-item{display:flex;align-items:center;gap:8px;padding:7px 10px;border-radius:8px;cursor:pointer;font-family:var(--dsw-font-mono,ui-monospace,SFMono-Regular,Menlo,monospace);font-size:12px;border:none;background:transparent;color:inherit;text-align:left;width:100%}
-.tm-item:hover{background:var(--dsw-alias-bg-module-platform,#f5f6f7)}
-.tm-item.on:hover{background:var(--dsw-alias-bg-layer-3,#eef0f3)}
-.tm-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.tm-tag{flex:none;font-size:11px;padding:0 6px;border-radius:999px;border:.5px solid currentColor;line-height:16px}
-.tm-tag.prefix{color:var(--dsw-alias-state-warn-primary,#c98a00)}
-.tm-empty{padding:28px 12px;text-align:center;color:var(--dsw-alias-label-dimmed,#adb3bc);font-size:12px}
-.tm-toast{align-self:flex-start;padding:5px 12px;border-radius:999px;background:var(--dsw-alias-label-primary,#15171a);color:var(--dsw-alias-bg-layer-1,#fff);font-size:12px}
+.tm-hint{color:var(--dsw-alias-label-tertiary,#6b7280);font-size:12px}
+.tm-warn{color:var(--dsw-alias-state-warn-primary,#c98a00);font-size:12px}
 .tm-err{color:var(--dsw-alias-label-error,#bb0000);font-size:12px}
-.tm-note{color:var(--dsw-alias-label-tertiary,#6b7280);font-size:11px;word-break:break-all}
+.tm-box{display:flex;flex-direction:column;overflow:hidden;border:.5px solid var(--dsw-alias-border-l3,rgba(0,0,0,.12));border-radius:12px;background:var(--dsw-alias-bg-layer-1,#fff);min-height:300px}
+.tm-box-head{display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:.5px solid var(--dsw-alias-border-l3,rgba(0,0,0,.12));background:var(--dsw-alias-bg-module-platform,#f5f6f7)}
+.tm-count{font-size:12px;color:var(--dsw-alias-label-tertiary,#6b7280)}
+.tm-search{margin-left:auto;width:150px;height:26px;padding:0 8px;border-radius:6px;border:.5px solid var(--dsw-alias-border-l3,rgba(0,0,0,.12));background:var(--dsw-alias-bg-layer-1,#fff);color:inherit;font:inherit;font-size:12px}
+.tm-list{flex:1;overflow:auto;padding:6px;display:flex;flex-direction:column;gap:1px;max-height:440px}
+.tm-row{display:flex;align-items:center;gap:10px;padding:6px 10px;border-radius:8px;border:none;background:transparent;color:inherit;text-align:left;width:100%;cursor:pointer;font-family:var(--dsw-font-mono,ui-monospace,SFMono-Regular,Menlo,monospace);font-size:12px}
+.tm-row:hover{background:var(--dsw-alias-bg-module-platform,#f5f6f7)}
+.tm-row:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#15171a);outline-offset:-2px}
+.tm-switch{flex:none;position:relative;width:28px;height:16px;border-radius:999px;background:var(--dsw-alias-bg-layer-3,#e0e3e8);transition:background .15s ease}
+.tm-switch::after{content:'';position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:50%;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.22);transition:transform .15s ease}
+.tm-row[data-off="true"] .tm-switch{background:var(--dsw-alias-label-error,#d92d20)}
+.tm-row[data-off="true"] .tm-switch::after{transform:translateX(12px)}
+.tm-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tm-tag{flex:none;font-size:11px;padding:0 6px;border-radius:999px;border:.5px solid currentColor;line-height:16px;font-family:var(--dsw-font-family,inherit)}
+.tm-tag.off{color:var(--dsw-alias-label-error,#d92d20)}
+.tm-tag.dim{color:var(--dsw-alias-label-dimmed,#a8aeb8)}
+.tm-empty{padding:32px 12px;text-align:center;color:var(--dsw-alias-label-dimmed,#adb3bc);font-size:12px}
+.tm-toast{align-self:flex-start;padding:4px 12px;border-radius:999px;background:var(--dsw-alias-label-primary,#15171a);color:var(--dsw-alias-bg-layer-1,#fff);font-size:12px}
+.tm-note{color:var(--dsw-alias-label-tertiary,#6b7280);font-size:11px;line-height:1.7}
 `
       document.head.appendChild(style)
     }
 
-    const EMPTY_RULE = { denyNames: [], denyPrefixes: [] }
-
-    function normalizeRule(raw) {
-      return {
-        denyNames: Array.isArray(raw?.denyNames) ? [...raw.denyNames] : [],
-        denyPrefixes: Array.isArray(raw?.denyPrefixes) ? [...raw.denyPrefixes] : []
-      }
-    }
-
-    // ── 设置页 ──────────────────────────────────────────────────
     function SettingsPage() {
       const [loading, setLoading] = useState(true)
-      const [error, setError] = useState('')
-      const [data, setData] = useState(null)
-      const [presetId, setPresetId] = useState('')
-      const [draft, setDraft] = useState({})
-      const [dirty, setDirty] = useState(false)
       const [busy, setBusy] = useState(false)
+      const [error, setError] = useState('')
       const [toast, setToast] = useState('')
-      const [queryOn, setQueryOn] = useState('')
-      const [queryOff, setQueryOff] = useState('')
+      const [presets, setPresets] = useState([])
+      const [presetId, setPresetId] = useState('')
+      const [tools, setTools] = useState([])
+      const [meta, setMeta] = useState({ sessions: 0, unverified: false, rulesFile: '' })
+      const [query, setQuery] = useState('')
 
-      const load = useCallback(async () => {
+      const load = useCallback(async (wanted) => {
         setLoading(true)
         setError('')
         try {
-          const state = await request('/state')
-          setData(state)
-          const next = {}
-          for (const [id, raw] of Object.entries(state?.rules ?? {})) next[id] = normalizeRule(raw)
-          setDraft(next)
-          setPresetId((previous) => {
-            if (typeof previous === 'string' && previous !== '' && (state?.presets ?? []).some((p) => p.id === previous)) {
-              return previous
-            }
-            return state?.presets?.[0]?.id ?? ''
+          const search = wanted ? `?preset=${encodeURIComponent(wanted)}` : ''
+          const state = await request(`/state${search}`)
+          setPresets(Array.isArray(state?.presets) ? state.presets : [])
+          setPresetId(typeof state?.presetId === 'string' ? state.presetId : '')
+          setTools(Array.isArray(state?.tools) ? state.tools : [])
+          setMeta({
+            sessions: typeof state?.sessions === 'number' ? state.sessions : 0,
+            unverified: state?.unverified === true,
+            rulesFile: typeof state?.rulesFile === 'string' ? state.rulesFile : ''
           })
-          setDirty(false)
         } catch (failure) {
           setError(failure?.message ?? String(failure))
         } finally {
@@ -139,206 +124,116 @@ window.__ModuleLoader__.load({
       }, [])
 
       useEffect(() => {
-        load()
+        void load('')
       }, [load])
 
       useEffect(() => {
         if (toast === '') return undefined
-        const timer = setTimeout(() => setToast(''), 3200)
+        const timer = setTimeout(() => setToast(''), 2600)
         return () => clearTimeout(timer)
       }, [toast])
 
-      const current = draft[presetId] ?? EMPTY_RULE
-      const tools = data?.tools ?? []
-      const presets = data?.presets ?? []
+      const deniedCount = useMemo(() => tools.filter((item) => item.denied).length, [tools])
 
-      const prefixHit = useCallback(
-        (name) => (current.denyPrefixes ?? []).some((prefix) => name.startsWith(prefix)),
-        [current.denyPrefixes]
-      )
-
-      const isDenied = useCallback(
-        (name) => (current.denyNames ?? []).includes(name) || prefixHit(name),
-        [current.denyNames, prefixHit]
-      )
-
-      const onList = useMemo(() => tools.filter((name) => !isDenied(name)), [tools, isDenied])
-      const offList = useMemo(() => tools.filter((name) => isDenied(name)), [tools, isDenied])
-
-      const filterByName = (list, query) => {
+      const shown = useMemo(() => {
         const keyword = query.trim().toLowerCase()
-        if (keyword === '') return list
-        return list.filter((name) => name.toLowerCase().includes(keyword))
-      }
-
-      const onShown = filterByName(onList, queryOn)
-      const offShown = filterByName(offList, queryOff)
-
-      const mutate = (updater) => {
-        setDraft((previous) => {
-          const rule = previous[presetId] ?? EMPTY_RULE
-          return { ...previous, [presetId]: updater(normalizeRule(rule)) }
+        const list = keyword === '' ? tools : tools.filter((item) => item.name.toLowerCase().includes(keyword))
+        // 禁用的排前面 —— 一眼能看到自己动过什么
+        return [...list].sort((a, b) => {
+          if (a.denied !== b.denied) return a.denied ? -1 : 1
+          return a.name.localeCompare(b.name)
         })
-        setDirty(true)
-      }
+      }, [tools, query])
 
-      const disable = (name) => {
-        if (prefixHit(name)) {
-          setToast(`「${name}」由前缀规则控制，要放开请改 cordis.patch.yml 里的 denyPrefixes`)
-          return
-        }
-        mutate((rule) => ({
-          ...rule,
-          denyNames: rule.denyNames.includes(name) ? rule.denyNames : [...rule.denyNames, name]
-        }))
-      }
+      const toggle = useCallback(
+        async (name) => {
+          const snapshot = tools
+          const next = tools.map((item) => (item.name === name ? { ...item, denied: !item.denied } : item))
+          const deny = next.filter((item) => item.denied).map((item) => item.name)
+          const turnedOff = next.some((item) => item.name === name && item.denied)
 
-      const enable = (name) => {
-        if (prefixHit(name)) {
-          setToast(`「${name}」命中前缀规则，删掉对应前缀才能真正启用`)
-          return
-        }
-        mutate((rule) => ({ ...rule, denyNames: rule.denyNames.filter((item) => item !== name) }))
-      }
-
-      const disableAll = () => {
-        mutate((rule) => {
-          const next = new Set(rule.denyNames)
-          for (const name of onList) {
-            if (!prefixHit(name)) next.add(name)
-          }
-          return { ...rule, denyNames: [...next] }
-        })
-      }
-
-      const enableAll = () => {
-        mutate((rule) => ({ ...rule, denyNames: [] }))
-      }
-
-      // 自动保存：点一下就写盘，不需要按按钮
-      const save = useCallback(async () => {
-        setBusy(true)
-        try {
-          const payload = {}
-          for (const [id, rule] of Object.entries(draft)) {
-            const clean = normalizeRule(rule)
-            if (clean.denyNames.length === 0 && clean.denyPrefixes.length === 0) continue
-            payload[id] = clean
-          }
-          await request('/rules', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ rules: payload })
-          })
-          setDirty(false)
-        } catch (failure) {
-          setToast(`保存失败：${failure?.message ?? failure}`)
-        } finally {
-          setBusy(false)
-        }
-      }, [draft])
-
-      // 改动后 700ms 无操作就落盘（连点几下只写一次）
-      useEffect(() => {
-        if (!dirty) return undefined
-        const timer = setTimeout(() => {
-          void save()
-        }, 700)
-        return () => clearTimeout(timer)
-      }, [dirty, draft, save])
-
-      const renderColumn = (options) => {
-        const { title, list, shown, total, query, setQuery, onPick, itemClass, tagOf, emptyText, action } = options
-        return h(
-          'div',
-          { className: 'tm-col' },
-          h(
-            'div',
-            { className: 'tm-col-head' },
-            h('span', { className: 'tm-col-title' }, title),
-            h('span', { className: 'tm-count' }, `${list.length} / ${total}`),
-            h('input', {
-              className: 'tm-search',
-              value: query,
-              placeholder: '筛选',
-              onChange: (event) => setQuery(event.target.value)
+          setTools(next)
+          setBusy(true)
+          try {
+            await request('/rules', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ presetId, deny })
             })
-          ),
-          action === undefined ? null : h('div', { style: { padding: '6px 12px 0' } }, action),
-          shown.length === 0
-            ? h('div', { className: 'tm-empty' }, emptyText)
-            : h(
-                'div',
-                { className: 'tm-list' },
-                shown.map((name) =>
-                  h(
-                    'button',
-                    {
-                      key: name,
-                      type: 'button',
-                      className: `tm-item${itemClass === true ? ' on' : ''}`,
-                      onClick: () => onPick(name),
-                      title: name
-                    },
-                    h('span', { className: 'tm-name' }, name),
-                    tagOf(name)
-                  )
-                )
-              )
-        )
-      }
+            setToast(`${turnedOff ? '已禁用' : '已放开'} ${name}`)
+          } catch (failure) {
+            setTools(snapshot)
+            setToast(`保存失败：${failure?.message ?? failure}`)
+          } finally {
+            setBusy(false)
+          }
+        },
+        [tools, presetId]
+      )
 
-      const tagForOff = (name) => {
-        if (!prefixHit(name)) return null
-        return h('span', { className: 'tm-tag prefix' }, '前缀')
+      const tagOf = (item) => {
+        if (item.denied) return h('span', { className: 'tm-tag off' }, '已禁用')
+        if (!item.visible) {
+          return h(
+            'span',
+            {
+              className: 'tm-tag dim',
+              title: '这个工具在选中的模式里现在看不到 —— 可能本来就属于别的模式，或者被别的插件挡了。本插件没动它。'
+            },
+            '不可见'
+          )
+        }
+        return null
       }
 
       const body =
-        data === null
-          ? null
+        loading && tools.length === 0
+          ? h('div', { className: 'tm-empty' }, '读取中…')
           : h(
               'div',
-              { className: 'tm-cols' },
-              renderColumn({
-                title: '已启用',
-                list: onList,
-                shown: onShown,
-                total: tools.length,
-                query: queryOn,
-                setQuery: setQueryOn,
-                onPick: disable,
-                itemClass: false,
-                tagOf: () => null,
-                emptyText: queryOn === '' ? '全部工具都禁用了' : '没有匹配的工具',
-                action:
-                  onList.length === 0
-                    ? null
-                    : h(
-                        'button',
-                        { type: 'button', className: 'tm-btn danger', onClick: disableAll },
-                        '全部禁用 →'
+              { className: 'tm-box' },
+              h(
+                'div',
+                { className: 'tm-box-head' },
+                h('span', { className: 'tm-count' }, `${tools.length} 个工具，禁用 ${deniedCount} 个`),
+                h('input', {
+                  className: 'tm-search',
+                  value: query,
+                  placeholder: '筛选工具名',
+                  onChange: (event) => setQuery(event.target.value)
+                })
+              ),
+              shown.length === 0
+                ? h('div', { className: 'tm-empty' }, query === '' ? '这个模式没有可管理的工具' : '没有匹配的工具')
+                : h(
+                    'div',
+                    { className: 'tm-list' },
+                    shown.map((item) =>
+                      h(
+                        'div',
+                        {
+                          key: item.name,
+                          className: 'tm-row',
+                          role: 'switch',
+                          tabIndex: 0,
+                          'aria-checked': item.denied,
+                          'data-off': item.denied ? 'true' : 'false',
+                          title: item.name,
+                          onClick: () => {
+                            if (!busy) void toggle(item.name)
+                          },
+                          onKeyDown: (event) => {
+                            if (event.key !== 'Enter' && event.key !== ' ') return
+                            event.preventDefault()
+                            if (!busy) void toggle(item.name)
+                          }
+                        },
+                        h('span', { className: 'tm-switch' }),
+                        h('span', { className: 'tm-name' }, item.name),
+                        tagOf(item)
                       )
-              }),
-              renderColumn({
-                title: '已禁用',
-                list: offList,
-                shown: offShown,
-                total: tools.length,
-                query: queryOff,
-                setQuery: setQueryOff,
-                onPick: enable,
-                itemClass: true,
-                tagOf: tagForOff,
-                emptyText: queryOff === '' ? '这个模式没有禁用任何工具' : '没有匹配的工具',
-                action:
-                  offList.length === 0
-                    ? null
-                    : h(
-                        'button',
-                        { type: 'button', className: 'tm-btn', onClick: enableAll },
-                        '← 全部启用'
-                      )
-              })
+                    )
+                  )
             )
 
       return h(
@@ -353,26 +248,29 @@ window.__ModuleLoader__.load({
             {
               className: 'tm-select',
               value: presetId,
-              onChange: (event) => setPresetId(event.target.value),
-              disabled: presets.length === 0
+              disabled: presets.length === 0 || busy,
+              onChange: (event) => void load(event.target.value)
             },
             presets.map((preset) =>
               h('option', { key: preset.id, value: preset.id }, preset.name === preset.id ? preset.id : `${preset.name}（${preset.id}）`)
             )
           ),
-          h('span', { className: 'tm-hint' }, '左边是模型能用的，点一下挪到右边就禁掉，改完自动保存'),
           h('span', { className: 'tm-spacer' }),
-          h('span', { className: 'tm-hint' }, busy ? '保存中…' : dirty ? '待保存…' : '已保存'),
-          h('button', { type: 'button', className: 'tm-btn', onClick: load, disabled: loading || busy }, '刷新')
+          h('span', { className: 'tm-hint' }, busy ? '写入中…' : ''),
+          h('button', { type: 'button', className: 'tm-btn', onClick: () => void load(presetId), disabled: loading || busy }, '刷新')
         ),
+        meta.sessions > 0
+          ? h('span', { className: 'tm-hint' }, `本模式 ${meta.sessions} 个活动会话，下面这张表是实时的`)
+          : h('span', { className: 'tm-warn' }, '本模式当前没有活动会话，工具清单取自全局注册表，标「不可见」的仅供参考'),
         error === '' ? null : h('div', { className: 'tm-err' }, error),
-        loading ? h('div', { className: 'tm-empty' }, '读取中…') : body,
+        body,
         toast === '' ? null : h('div', { className: 'tm-toast' }, toast),
         h(
           'div',
           { className: 'tm-note' },
-          '本插件只判断「要不要禁用」，不设白名单、不管启用 —— 没被禁用的工具一概不碰，交给其它插件。改动落在插件自己的 rules.json，不动 profile 配置。'
-        )
+          '这里只管禁用。开关打开 = 禁用（模型看不到、也调不动）；关掉 = 本插件不管这个工具，能不能用由 dsh 和别的插件决定。'
+        ),
+        meta.rulesFile === '' ? null : h('div', { className: 'tm-note' }, `规则文件：${meta.rulesFile}`)
       )
     }
 
