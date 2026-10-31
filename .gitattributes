@@ -1,0 +1,11 @@
+# 统一行尾：仓库内一律 LF，检出也不转换
+# （dsh 插件是跨平台 npm 包，混 CRLF 容易在 Linux 侧出幺蛾子）
+* text=auto eol=lf
+
+*.js   text eol=lf
+*.json text eol=lf
+*.yml  text eol=lf
+*.md   text eol=lf
+
+*.png binary
+*.jpg binary

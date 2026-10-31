@@ -1,0 +1,47 @@
+{
+  "name": "@gw/dsh-tools-manager",
+  "version": "0.2.0",
+  "description": "DeepSeek Harness plugin: 按 Agent 预设（模式）遮蔽工具，带双栏设置页（左启用 / 右禁用）。一个插件管全部模式，规则不写死。",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "tools",
+    "restrict",
+    "settings"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2"
+  },
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
+  }
+}

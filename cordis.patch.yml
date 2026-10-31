@@ -1,0 +1,26 @@
+# @gw/dsh-tools-manager —— 挂载行
+#
+# ⚠ 必须挂「裸包名」且包要真装进 profile 的 node_modules（link: 也算），
+#   不能用 file:// —— 那样浏览器半会连坐搞挂整个前端 bundle。
+#   装配步骤见 README 的「挂载方式」。
+#
+# 这是 Host 平面插件（不是某个模式内部的行），因为它要收全部 agent 的 created 事件。
+#
+# 默认不带任何规则：装上之后所有模式、所有工具全部放行，什么都不动。
+# 哪个模式要禁什么，去「设置 → 工具管理」里点，保存即生效。
+# 规则落在 ~/.dsh/plugin-data/tools-manager/rules.json，不写回这个文件。
+- insert:
+    - id: tools-manager
+      name: '@gw/dsh-tools-manager'
+      config: {}
+      # ↓ 想用配置文件预置规则时再填，正常情况下留空就行。字段含义：
+      #   rules.<presetId>   preset id（standard / ptc / minimal / cordis / qq / 以后新增的任意 id）
+      #   rules['*']         兜底
+      #   defaultRule        连 '*' 都没配时用
+      #   denyNames          精确工具名（设置页改的就是这个）
+      #   denyPrefixes       工具名前缀（插件升级改名也能跟上）
+      #
+      # rules:
+      #   qq:
+      #     denyPrefixes: [hindsight_]
+      #   '*': {}

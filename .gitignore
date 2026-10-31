@@ -1,0 +1,6 @@
+node_modules/
+*.tgz
+*.log
+
+# 本地临时备份目录（有 git 之后不需要，防手滑重建）
+_backup-*/
