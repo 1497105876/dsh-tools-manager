@@ -73,20 +73,25 @@ window.__ModuleLoader__.load({
 .tm-count{font-size:12px;color:var(--dsw-alias-label-tertiary,#6b7280)}
 .tm-search{margin-left:auto;width:150px;height:26px;padding:0 8px;border-radius:6px;border:.5px solid var(--dsw-alias-border-l3,rgba(0,0,0,.12));background:var(--dsw-alias-bg-layer-1,#fff);color:inherit;font:inherit;font-size:12px}
 .tm-list{flex:1;overflow:auto;padding:6px;display:flex;flex-direction:column;gap:1px;max-height:440px}
-.tm-item{display:grid;grid-template-columns:1fr auto;align-items:start;border-radius:8px}
+.tm-item{display:grid;grid-template-columns:auto 1fr;align-items:stretch;border-radius:8px}
 .tm-item:hover{background:var(--dsw-alias-bg-module-platform,#f5f6f7)}
-.tm-row{display:flex;align-items:center;gap:10px;padding:6px 4px 6px 10px;color:inherit;text-align:left;cursor:pointer;font-family:var(--dsw-font-mono,ui-monospace,SFMono-Regular,Menlo,monospace);font-size:12px;grid-column:1;border-radius:8px}
-.tm-row:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#15171a);outline-offset:-2px}
-.tm-more{grid-column:2;align-self:center;margin-right:6px;height:22px;padding:0 8px;border-radius:6px;border:.5px solid transparent;background:transparent;color:var(--dsw-alias-label-tertiary,#6b7280);font:inherit;font-size:11px;cursor:pointer;transition:all .12s ease}
-.tm-more:hover{border-color:var(--dsw-alias-border-l3,rgba(0,0,0,.12));background:var(--dsw-alias-bg-layer-1,#fff);color:inherit}
-.tm-more[aria-expanded="true"]{border-color:var(--dsw-alias-border-l3,rgba(0,0,0,.12));background:var(--dsw-alias-bg-layer-1,#fff);color:inherit}
+/* 左：只有开关这一小块是禁用开关。撑满行高，上下不留死区 */
+.tm-toggle{grid-column:1;display:flex;align-items:center;justify-content:center;align-self:stretch;padding:0 6px 0 10px;border:none;background:transparent;cursor:pointer;border-radius:8px 0 0 8px}
+.tm-toggle:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#15171a);outline-offset:-3px}
+/* 右：从工具名一直到最右边，整块点击展开说明 */
+.tm-main{grid-column:2;display:flex;align-items:center;gap:8px;min-width:0;align-self:stretch;padding:9px 10px 9px 2px;cursor:pointer;border-radius:0 8px 8px 0}
+.tm-main:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#15171a);outline-offset:-3px}
+.tm-more{flex:none;font-size:11px;color:var(--dsw-alias-label-tertiary,#6b7280);transition:color .12s ease;font-family:var(--dsw-font-family,inherit)}
+.tm-main:hover .tm-more{color:var(--dsw-alias-label-primary,#15171a)}
+.tm-main[aria-expanded="true"] .tm-more{color:var(--dsw-alias-label-primary,#15171a)}
 .tm-switch{flex:none;position:relative;width:28px;height:16px;border-radius:999px;background:var(--dsw-alias-bg-layer-3,#e0e3e8);transition:background .15s ease}
 .tm-switch::after{content:'';position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:50%;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.22);transition:transform .15s ease}
+.tm-toggle:hover .tm-switch{box-shadow:0 0 0 3px rgba(0,0,0,.05)}
 .tm-item[data-off="true"] .tm-switch{background:var(--dsw-alias-label-error,#d92d20)}
 .tm-item[data-off="true"] .tm-switch::after{transform:translateX(12px)}
-.tm-desc{grid-column:1 / -1;padding:2px 12px 9px 48px;font-family:var(--dsw-font-family,inherit);font-size:12px;line-height:1.65;color:var(--dsw-alias-label-secondary,#4b5563);white-space:pre-wrap;word-break:break-word}
+.tm-desc{grid-column:1 / -1;padding:1px 12px 10px 46px;font-family:var(--dsw-font-family,inherit);font-size:12px;line-height:1.65;color:var(--dsw-alias-label-secondary,#4b5563);white-space:pre-wrap;word-break:break-word}
 .tm-desc-none{color:var(--dsw-alias-label-dimmed,#a8aeb8)}
-.tm-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tm-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--dsw-font-mono,ui-monospace,SFMono-Regular,Menlo,monospace);font-size:12px}
 .tm-tag{flex:none;font-size:11px;padding:0 6px;border-radius:999px;border:.5px solid currentColor;line-height:16px;font-family:var(--dsw-font-family,inherit)}
 .tm-tag.off{color:var(--dsw-alias-label-error,#d92d20)}
 .tm-tag.dim{color:var(--dsw-alias-label-dimmed,#a8aeb8)}
@@ -228,39 +233,40 @@ window.__ModuleLoader__.load({
                       return h(
                         'div',
                         { key: item.name, className: 'tm-item', 'data-off': item.denied ? 'true' : 'false' },
-                        // 左侧：开关 + 名字 + 状态，点这里切换禁用
-                        h(
-                          'div',
-                          {
-                            className: 'tm-row',
-                            role: 'switch',
-                            tabIndex: 0,
-                            'aria-checked': item.denied,
-                            title: `${item.denied ? '放开' : '禁用'} ${item.name}`,
-                            onClick: () => {
-                              if (!busy) void toggle(item.name)
-                            },
-                            onKeyDown: (event) => {
-                              if (event.key !== 'Enter' && event.key !== ' ') return
-                              event.preventDefault()
-                              if (!busy) void toggle(item.name)
-                            }
-                          },
-                          h('span', { className: 'tm-switch' }),
-                          h('span', { className: 'tm-name' }, item.name),
-                          tagOf(item)
-                        ),
-                        // 右侧：展开这个工具的说明
+                        // 左：只有开关这一小块 —— 点它才是禁用/放开
                         h(
                           'button',
                           {
                             type: 'button',
-                            className: 'tm-more',
-                            'aria-expanded': open,
-                            title: open ? '收起说明' : '展开说明',
-                            onClick: () => toggleDetail(item.name)
+                            className: 'tm-toggle',
+                            role: 'switch',
+                            'aria-checked': item.denied,
+                            title: `${item.denied ? '放开' : '禁用'} ${item.name}`,
+                            onClick: () => {
+                              if (!busy) void toggle(item.name)
+                            }
                           },
-                          open ? '收起' : '说明'
+                          h('span', { className: 'tm-switch' })
+                        ),
+                        // 右：工具名 + 状态 + 「说明」，整块点击展开详情
+                        h(
+                          'div',
+                          {
+                            className: 'tm-main',
+                            role: 'button',
+                            tabIndex: 0,
+                            'aria-expanded': open,
+                            title: open ? '收起说明' : '查看说明',
+                            onClick: () => toggleDetail(item.name),
+                            onKeyDown: (event) => {
+                              if (event.key !== 'Enter' && event.key !== ' ') return
+                              event.preventDefault()
+                              toggleDetail(item.name)
+                            }
+                          },
+                          h('span', { className: 'tm-name' }, item.name),
+                          tagOf(item),
+                          h('span', { className: 'tm-more' }, open ? '收起' : '说明')
                         ),
                         open
                           ? h(
