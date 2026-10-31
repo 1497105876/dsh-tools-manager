@@ -1,16 +1,17 @@
 {
   "name": "@gw/dsh-tools-manager",
-  "version": "0.3.0",
-  "description": "DeepSeek Harness plugin: 按 Agent 预设（模式）禁用工具。只有黑名单，没有白名单 —— 没被点名禁用的工具一概不碰。",
-  "keywords": [
-    "dsh",
-    "deepseek-harness",
-    "plugin",
-    "tools",
-    "deny",
-    "settings"
-  ],
+  "version": "2.1.100",
+  "description": "按 Agent 预设（模式）禁用工具。只有黑名单，没有白名单 —— 没被点名禁用的工具一概不碰。Disable model-facing tools per agent preset from a DSH settings page; deny-only, never an allowlist.",
   "license": "MIT",
+  "author": "gw",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/1497105876/dsh-tools-manager.git"
+  },
+  "homepage": "https://github.com/1497105876/dsh-tools-manager#readme",
+  "bugs": {
+    "url": "https://github.com/1497105876/dsh-tools-manager/issues"
+  },
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -22,11 +23,29 @@
   "files": [
     "index.js",
     "client.js",
-    "cordis.patch.yml"
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
   ],
-  "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.2"
+  "engines": {
+    "node": ">=18",
+    "dsh": ">=0.2.1-rc.2 <0.3.0"
   },
+  "peerDependencies": {
+    "@deepseek-ai/dsh": ">=0.2.1-rc.2 <0.3.0"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "dsh-web",
+    "tools",
+    "tool-filter",
+    "deny",
+    "settings",
+    "工具管理",
+    "工具禁用"
+  ],
   "dsh": {
     "manifestVersion": 1,
     "bundle": {
