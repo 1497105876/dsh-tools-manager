@@ -226,13 +226,24 @@ export function apply(ctx, config) {
         return undefined
     }
 
-    /** 一个 agent 当前真正看得见的工具名。restrict 生效后，被禁的那些不在这里。 */
+    /**
+     * 一个 agent 当前真正看得见的工具：名字 → 描述。
+     * restrict 生效后，被禁的那些不在这里。
+     * 描述取 schema 上的 description，给设置页展开详情用。
+     */
     const visibleNames = (agent, tools) => {
         try {
             const schemas = tools.schemas(agent)
             if (!Array.isArray(schemas)) return undefined
-            const names = new Set()
-            for (const schema of schemas) if (isNonEmptyString(schema?.name)) names.add(schema.name)
+            const names = new Map()
+            for (const schema of schemas) {
+                if (!isNonEmptyString(schema?.name)) continue
+                const text = typeof schema.description === 'string' ? schema.description.trim() : ''
+                // 同一个工具可能被多个 agent 看到，描述取第一个非空的
+                if (!names.has(schema.name) || (names.get(schema.name) === '' && text !== '')) {
+                    names.set(schema.name, text)
+                }
+            }
             return names
         } catch {
             return undefined
@@ -300,6 +311,8 @@ export function apply(ctx, config) {
             return
         }
 
+        // 这一读必须在装 restrict 之前 —— 装完被禁的工具就不在 schemas 里了，
+        // 设置页的「展开说明」也就拿不到描述。存一份当缓存。
         const visible = visibleNames(agent, tools)
         const deny = visible === undefined ? [] : [...rule].filter((item) => visible.has(item))
 
@@ -327,7 +340,14 @@ export function apply(ctx, config) {
 
         if (deny.length > 0) log('info', `[${presetId}] 已禁 ${deny.length} 个：${deny.join(' ')}`)
 
-        agents.set(agent, { presetId, rule, handles, version: rulesVersion })
+        agents.set(agent, {
+            presetId,
+            rule,
+            handles,
+            version: rulesVersion,
+            // 工具名 → 描述。含此刻被禁的那些，给设置页展开详情用
+            known: visible ?? new Map()
+        })
     }
 
     /**
@@ -441,20 +461,35 @@ export function apply(ctx, config) {
         return out
     }
 
-    /** 该 preset 下所有存活 agent 的可见工具并集。 */
+    /**
+     * 该 preset 下所有存活 agent 的工具：名字 → 描述。
+     *
+     * visible 是「此刻真看得见的」（restrict 之后），known 是「见过的」——
+     * 被禁的工具不在 visible 里，但它的描述在 mount 那一刻就缓存进 known 了，
+     * 所以设置页展开已禁用的工具照样能看到它是什么。
+     */
     const liveTools = (presetId) => {
-        const visible = new Set()
+        const visible = new Map()
+        const known = new Map()
         let sessions = 0
         for (const [agent, state] of agents) {
             if (state.presetId !== presetId) continue
             sessions += 1
             const tools = toolsOf(agent)
-            if (tools === undefined) continue
-            const names = visibleNames(agent, tools)
-            if (names === undefined) continue
-            for (const item of names) visible.add(item)
+            if (tools !== undefined) {
+                const now = visibleNames(agent, tools)
+                if (now !== undefined) {
+                    for (const [name, text] of now) {
+                        visible.set(name, text)
+                        if (!known.has(name) || (known.get(name) === '' && text !== '')) known.set(name, text)
+                    }
+                }
+            }
+            for (const [name, text] of state.known ?? []) {
+                if (!known.has(name) || (known.get(name) === '' && text !== '')) known.set(name, text)
+            }
         }
-        return { visible, sessions }
+        return { visible, known, sessions }
     }
 
     /**
@@ -462,13 +497,19 @@ export function apply(ctx, config) {
      * 那是「注册过」不是「这个模式有」，所以单独标出来，让界面说清楚。
      */
     const globalTools = () => {
-        const visible = new Set()
+        const visible = new Map()
         try {
             const service = ctx.get?.('tools')
             if (typeof service?.schemas === 'function') {
                 const schemas = service.schemas()
                 if (Array.isArray(schemas)) {
-                    for (const schema of schemas) if (isNonEmptyString(schema?.name)) visible.add(schema.name)
+                    for (const schema of schemas) {
+                        if (!isNonEmptyString(schema?.name)) continue
+                        const text = typeof schema.description === 'string' ? schema.description.trim() : ''
+                        if (!visible.has(schema.name) || (visible.get(schema.name) === '' && text !== '')) {
+                            visible.set(schema.name, text)
+                        }
+                    }
                 }
             }
         } catch {
@@ -481,22 +522,35 @@ export function apply(ctx, config) {
         const presets = await listPresets()
         const presetId = presets.some((item) => item.id === wanted) ? wanted : presets[0]?.id ?? ''
 
-        const { visible, sessions } = liveTools(presetId)
+        const { visible, known, sessions } = liveTools(presetId)
         let unverified = false
         if (sessions === 0) {
             unverified = true
-            for (const item of globalTools()) visible.add(item)
+            for (const [name, text] of globalTools()) {
+                if (!visible.has(name)) visible.set(name, text)
+                if (!known.has(name)) known.set(name, text)
+            }
         }
 
         const rule = rules.get(presetId) ?? new Set()
-        // 清单 = 这个模式现在看得见的 ∪ 规则里点名要禁的。
-        // 不再有第三个来源 —— 历史目录那种「以前见过」的东西全部不算数。
-        const names = new Set([...visible, ...rule])
+        // 清单 = 见过的（含已被禁的）∪ 规则里点名要禁的。
+        // 不再有「以前见过但现在没了」那种历史目录 —— 那才是脏数据的来源。
+        const names = new Set([...known.keys(), ...rule])
+
+        // 描述优先用当前 schema 上的，被禁的退到 mount 时的缓存
+        const descOf = (name) => {
+            const now = visible.get(name)
+            if (typeof now === 'string' && now !== '') return now
+            const cached = known.get(name)
+            if (typeof cached === 'string' && cached !== '') return cached
+            return ''
+        }
 
         const tools = [...names].sort().map((item) => ({
             name: item,
             visible: visible.has(item),
-            denied: rule.has(item)
+            denied: rule.has(item),
+            description: descOf(item)
         }))
 
         json(res, 200, {

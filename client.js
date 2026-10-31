@@ -73,13 +73,19 @@ window.__ModuleLoader__.load({
 .tm-count{font-size:12px;color:var(--dsw-alias-label-tertiary,#6b7280)}
 .tm-search{margin-left:auto;width:150px;height:26px;padding:0 8px;border-radius:6px;border:.5px solid var(--dsw-alias-border-l3,rgba(0,0,0,.12));background:var(--dsw-alias-bg-layer-1,#fff);color:inherit;font:inherit;font-size:12px}
 .tm-list{flex:1;overflow:auto;padding:6px;display:flex;flex-direction:column;gap:1px;max-height:440px}
-.tm-row{display:flex;align-items:center;gap:10px;padding:6px 10px;border-radius:8px;border:none;background:transparent;color:inherit;text-align:left;width:100%;cursor:pointer;font-family:var(--dsw-font-mono,ui-monospace,SFMono-Regular,Menlo,monospace);font-size:12px}
-.tm-row:hover{background:var(--dsw-alias-bg-module-platform,#f5f6f7)}
+.tm-item{display:grid;grid-template-columns:1fr auto;align-items:start;border-radius:8px}
+.tm-item:hover{background:var(--dsw-alias-bg-module-platform,#f5f6f7)}
+.tm-row{display:flex;align-items:center;gap:10px;padding:6px 4px 6px 10px;color:inherit;text-align:left;cursor:pointer;font-family:var(--dsw-font-mono,ui-monospace,SFMono-Regular,Menlo,monospace);font-size:12px;grid-column:1;border-radius:8px}
 .tm-row:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#15171a);outline-offset:-2px}
+.tm-more{grid-column:2;align-self:center;margin-right:6px;height:22px;padding:0 8px;border-radius:6px;border:.5px solid transparent;background:transparent;color:var(--dsw-alias-label-tertiary,#6b7280);font:inherit;font-size:11px;cursor:pointer;transition:all .12s ease}
+.tm-more:hover{border-color:var(--dsw-alias-border-l3,rgba(0,0,0,.12));background:var(--dsw-alias-bg-layer-1,#fff);color:inherit}
+.tm-more[aria-expanded="true"]{border-color:var(--dsw-alias-border-l3,rgba(0,0,0,.12));background:var(--dsw-alias-bg-layer-1,#fff);color:inherit}
 .tm-switch{flex:none;position:relative;width:28px;height:16px;border-radius:999px;background:var(--dsw-alias-bg-layer-3,#e0e3e8);transition:background .15s ease}
 .tm-switch::after{content:'';position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:50%;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.22);transition:transform .15s ease}
-.tm-row[data-off="true"] .tm-switch{background:var(--dsw-alias-label-error,#d92d20)}
-.tm-row[data-off="true"] .tm-switch::after{transform:translateX(12px)}
+.tm-item[data-off="true"] .tm-switch{background:var(--dsw-alias-label-error,#d92d20)}
+.tm-item[data-off="true"] .tm-switch::after{transform:translateX(12px)}
+.tm-desc{grid-column:1 / -1;padding:2px 12px 9px 48px;font-family:var(--dsw-font-family,inherit);font-size:12px;line-height:1.65;color:var(--dsw-alias-label-secondary,#4b5563);white-space:pre-wrap;word-break:break-word}
+.tm-desc-none{color:var(--dsw-alias-label-dimmed,#a8aeb8)}
 .tm-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .tm-tag{flex:none;font-size:11px;padding:0 6px;border-radius:999px;border:.5px solid currentColor;line-height:16px;font-family:var(--dsw-font-family,inherit)}
 .tm-tag.off{color:var(--dsw-alias-label-error,#d92d20)}
@@ -101,6 +107,7 @@ window.__ModuleLoader__.load({
       const [tools, setTools] = useState([])
       const [meta, setMeta] = useState({ sessions: 0, unverified: false, rulesFile: '' })
       const [query, setQuery] = useState('')
+      const [opened, setOpened] = useState(() => new Set())
 
       const load = useCallback(async (wanted) => {
         setLoading(true)
@@ -116,6 +123,8 @@ window.__ModuleLoader__.load({
             unverified: state?.unverified === true,
             rulesFile: typeof state?.rulesFile === 'string' ? state.rulesFile : ''
           })
+          // 换了模式就收起所有详情，免得看到别的模式留下的展开项
+          setOpened(new Set())
         } catch (failure) {
           setError(failure?.message ?? String(failure))
         } finally {
@@ -138,11 +147,8 @@ window.__ModuleLoader__.load({
       const shown = useMemo(() => {
         const keyword = query.trim().toLowerCase()
         const list = keyword === '' ? tools : tools.filter((item) => item.name.toLowerCase().includes(keyword))
-        // 禁用的排前面 —— 一眼能看到自己动过什么
-        return [...list].sort((a, b) => {
-          if (a.denied !== b.denied) return a.denied ? -1 : 1
-          return a.name.localeCompare(b.name)
-        })
+        // 固定按名字排，不因为禁用就往前挪 —— 位置稳定才好找
+        return [...list].sort((a, b) => a.name.localeCompare(b.name))
       }, [tools, query])
 
       const toggle = useCallback(
@@ -170,6 +176,15 @@ window.__ModuleLoader__.load({
         },
         [tools, presetId]
       )
+
+      const toggleDetail = useCallback((name) => {
+        setOpened((previous) => {
+          const next = new Set(previous)
+          if (next.has(name)) next.delete(name)
+          else next.add(name)
+          return next
+        })
+      }, [])
 
       const tagOf = (item) => {
         if (item.denied) return h('span', { className: 'tm-tag off' }, '已禁用')
@@ -208,31 +223,62 @@ window.__ModuleLoader__.load({
                 : h(
                     'div',
                     { className: 'tm-list' },
-                    shown.map((item) =>
-                      h(
+                    shown.map((item) => {
+                      const open = opened.has(item.name)
+                      return h(
                         'div',
-                        {
-                          key: item.name,
-                          className: 'tm-row',
-                          role: 'switch',
-                          tabIndex: 0,
-                          'aria-checked': item.denied,
-                          'data-off': item.denied ? 'true' : 'false',
-                          title: item.name,
-                          onClick: () => {
-                            if (!busy) void toggle(item.name)
+                        { key: item.name, className: 'tm-item', 'data-off': item.denied ? 'true' : 'false' },
+                        // 左侧：开关 + 名字 + 状态，点这里切换禁用
+                        h(
+                          'div',
+                          {
+                            className: 'tm-row',
+                            role: 'switch',
+                            tabIndex: 0,
+                            'aria-checked': item.denied,
+                            title: `${item.denied ? '放开' : '禁用'} ${item.name}`,
+                            onClick: () => {
+                              if (!busy) void toggle(item.name)
+                            },
+                            onKeyDown: (event) => {
+                              if (event.key !== 'Enter' && event.key !== ' ') return
+                              event.preventDefault()
+                              if (!busy) void toggle(item.name)
+                            }
                           },
-                          onKeyDown: (event) => {
-                            if (event.key !== 'Enter' && event.key !== ' ') return
-                            event.preventDefault()
-                            if (!busy) void toggle(item.name)
-                          }
-                        },
-                        h('span', { className: 'tm-switch' }),
-                        h('span', { className: 'tm-name' }, item.name),
-                        tagOf(item)
+                          h('span', { className: 'tm-switch' }),
+                          h('span', { className: 'tm-name' }, item.name),
+                          tagOf(item)
+                        ),
+                        // 右侧：展开这个工具的说明
+                        h(
+                          'button',
+                          {
+                            type: 'button',
+                            className: 'tm-more',
+                            'aria-expanded': open,
+                            title: open ? '收起说明' : '展开说明',
+                            onClick: () => toggleDetail(item.name)
+                          },
+                          open ? '收起' : '说明'
+                        ),
+                        open
+                          ? h(
+                              'div',
+                              { className: 'tm-desc' },
+                              item.description === '' || item.description === undefined
+                                ? h(
+                                    'span',
+                                    { className: 'tm-desc-none' },
+                                    item.visible
+                                      ? '这个工具没有写描述。'
+                                      : '取不到描述 —— 它现在不在这个模式的工具表里。'
+                                  )
+                                : item.description
+                            )
+                          : null
                       )
-                    )
+                    })
                   )
             )
 
