@@ -37,9 +37,19 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 export const name = 'tools-manager'
-// agentPresets 是必需依赖（读「这个 agent 实际挂载的 preset」）。
-// webServer 不 inject —— 没有它只是没设置页，禁用逻辑照样跑，不该整个插件起不来。
-export const inject = ['agentPresets']
+/**
+ * inject 声明（cordis 严格模式：声明了才保证 apply 时服务已就绪）。
+ *
+ * ⚠ webServer 必须 inject。插件是在 profile 启动早期加载的，那一刻 webServer
+ *   往往还没起来；不声明依赖就去 ctx.get('webServer')，拿到 undefined，接口
+ *   静默不注册 —— 表现就是「装上当场好用，一重启就 HTTP 404，重装又好了」
+ *   （重装是运行中动态插入，那时 webServer 早就绪了）。
+ *   2026-10-31 v0.3.0 重写时把这行摘掉导致过这个回归。
+ *
+ * agentPresets —— 读「这个 agent 实际挂载的 preset」，核心依赖。
+ * tools / dshHomePath 走 ctx.get()，按可选处理（拿不到就降级）。
+ */
+export const inject = ['webServer', 'agentPresets']
 
 /** 设置页接口前缀 —— 浏览器半的 fetch 必须跟这里一致。 */
 const API_PREFIX = '/api/plugins/tools-manager'
@@ -602,7 +612,8 @@ export function apply(ctx, config) {
     try {
         const webServer = ctx.get?.('webServer')
         if (webServer === undefined || typeof webServer.register !== 'function') {
-            log('warn', 'Host 没有 webServer 服务，设置页接口不注册（禁用逻辑照常工作）')
+            // inject 里声明了 webServer，走到这里说明依赖没兑现 —— 不是正常降级
+            log('warn', `取不到 webServer 服务（inject 已声明），设置页接口不注册，页面会 404`)
         } else {
             disposeApi = webServer.register({
                 kind: 'prefix',

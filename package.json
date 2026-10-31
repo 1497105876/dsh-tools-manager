@@ -1,6 +1,6 @@
 {
   "name": "@gw/dsh-tools-manager",
-  "version": "2.1.1003",
+  "version": "2.1.1004",
   "description": "按 Agent 预设（模式）禁用工具。只有黑名单，没有白名单 —— 没被点名禁用的工具一概不碰。Disable model-facing tools per agent preset from a DSH settings page; deny-only, never an allowlist.",
   "license": "MIT",
   "author": "gw",
